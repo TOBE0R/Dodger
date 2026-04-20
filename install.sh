@@ -174,7 +174,7 @@ PYEOF
 
   echo ""
   echo "════════════════════════════════════"
-  echo -e "${CYAN}        Ссылка для подключения${NC}"
+  echo -e "${CYAN}      Ссылка для подключения${NC}"
   echo "════════════════════════════════════"
   echo -e "VLESS ссылка:"
   echo -e "${GREEN}${LINK}${NC}"
@@ -229,8 +229,22 @@ install() {
   read -p "Порт [443]: " PORT
   PORT=${PORT:-443}
 
+  # Проверяем что порт свободен
+  if ss -tlnp | grep -q ":${PORT} " ; then
+    BUSY_BY=$(ss -tlnp | grep ":${PORT} " | awk '{print $NF}')
+    err "Порт ${PORT} уже занят: ${BUSY_BY}. Останови процесс или выбери другой порт."
+  fi
+
   read -p "SNI (например, www.google.com): " SNI
   [[ -z "$SNI" ]] && err "SNI не может быть пустым"
+
+  # Проверяем доступность SNI
+  log "Проверяю доступность SNI..."
+  if ! curl -sI --max-time 5 "https://${SNI}" > /dev/null 2>&1; then
+    echo -e "${YELLOW}[!]${NC} SNI ${SNI} недоступен с этого сервера. Продолжить всё равно? [y/N]"
+    read -p "" CONFIRM
+    [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && err "Прерываем установку. Выбери другой SNI."
+  fi
 
   echo ""
   echo "Доступные отпечатки:"
@@ -375,7 +389,7 @@ EOF
   chmod +x /usr/local/bin/xray-manage
 
   # Алиасы
-  cat >> /etc/bash.bashrc <<'EOF'
+  cat >> /etc/bash.bashrc <<'BASHEOF'
 
 # xray management
 alias menu='xray-manage menu'
@@ -384,7 +398,7 @@ alias mainuser='xray-manage mainuser'
 alias newuser='xray-manage newuser'
 alias rmuser='xray-manage rmuser'
 alias sharelink='xray-manage sharelink'
-EOF
+BASHEOF
 
   source /etc/bash.bashrc
 
@@ -416,7 +430,7 @@ EOF
   echo -e "  ${CYAN}rmuser${NC}    — удалить пользователя"
   echo -e "  ${CYAN}sharelink${NC} — ссылка для любого пользователя"
   echo ""
-  echo -e "${YELLOW}Примечание: перелогинься или выполни 'source /etc/bash.bashrc' чтобы команды заработали${NC}"
+  echo -e "${YELLOW}Выполни 'source /etc/bash.bashrc' чтобы команды заработали сразу${NC}"
 }
 
 # ─── Точка входа ─────────────────────────────────────────
