@@ -32,14 +32,18 @@ make_link() {
   fi
 }
 
-# ─── Команды ─────────────────────────────────────────────
+install_commands() {
+  log "Устанавливаю команды управления..."
 
-userlist() {
-  [[ ! -f $CONFIG ]] && err "Xray не установлен"
-  echo ""
-  echo -e "${CYAN}Список пользователей:${NC}"
-  echo "────────────────────────────────────"
-  python3 - <<PYEOF
+  # userlist
+  cat > /usr/local/bin/userlist <<'EOF'
+#!/bin/bash
+CONFIG="/usr/local/etc/xray/config.json"
+[[ ! -f $CONFIG ]] && echo "Xray не установлен" && exit 1
+echo ""
+echo "Список пользователей:"
+echo "────────────────────────────────────"
+python3 - <<PYEOF
 import json
 with open("$CONFIG") as f:
     config = json.load(f)
@@ -48,15 +52,19 @@ for i, c in enumerate(clients):
     print(f"  {i+1}) {c['id']}")
 print(f"\nВсего: {len(clients)}")
 PYEOF
-  echo ""
-}
+echo ""
+EOF
 
-mainuser() {
-  [[ ! -f $CONFIG ]] && err "Xray не установлен"
-  [[ ! -f $PARAMS ]] && err "Файл параметров не найден, переустанови сервер"
-  source $PARAMS
+  # mainuser
+  cat > /usr/local/bin/mainuser <<'EOF'
+#!/bin/bash
+CONFIG="/usr/local/etc/xray/config.json"
+PARAMS="/usr/local/etc/xray/params.env"
+[[ ! -f $CONFIG ]] && echo "Xray не установлен" && exit 1
+[[ ! -f $PARAMS ]] && echo "Файл параметров не найден" && exit 1
+source $PARAMS
 
-  UUID=$(python3 - <<PYEOF
+UUID=$(python3 - <<PYEOF
 import json
 with open("$CONFIG") as f:
     config = json.load(f)
@@ -64,40 +72,48 @@ print(config["inbounds"][0]["settings"]["clients"][0]["id"])
 PYEOF
 )
 
-  LINK=$(make_link "$UUID" "MainUser")
+if [[ "$TRANSPORT" == "tcp" ]]; then
+  LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#MainUser"
+else
+  LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=%2F#MainUser"
+fi
 
-  echo ""
-  echo "════════════════════════════════════"
-  echo -e "${CYAN}        Основной пользователь${NC}"
-  echo "════════════════════════════════════"
-  echo -e "UUID: ${YELLOW}${UUID}${NC}"
-  echo ""
-  echo -e "VLESS ссылка:"
-  echo -e "${GREEN}${LINK}${NC}"
-  echo ""
-  echo "QR код:"
-  echo ""
-  qrencode -t ANSIUTF8 "$LINK"
-}
+echo ""
+echo "════════════════════════════════════"
+echo "        Основной пользователь"
+echo "════════════════════════════════════"
+echo "UUID: $UUID"
+echo ""
+echo "VLESS ссылка:"
+echo "$LINK"
+echo ""
+echo "QR код:"
+echo ""
+qrencode -t ANSIUTF8 "$LINK"
+EOF
 
-newuser() {
-  [[ ! -f $CONFIG ]] && err "Xray не установлен"
-  [[ ! -f $PARAMS ]] && err "Файл параметров не найден, переустанови сервер"
-  source $PARAMS
+  # newuser
+  cat > /usr/local/bin/newuser <<'EOF'
+#!/bin/bash
+CONFIG="/usr/local/etc/xray/config.json"
+PARAMS="/usr/local/etc/xray/params.env"
+[[ ! -f $CONFIG ]] && echo "Xray не установлен" && exit 1
+[[ ! -f $PARAMS ]] && echo "Файл параметров не найден" && exit 1
+source $PARAMS
 
-  echo ""
-  read -p "Имя пользователя (для метки): " USERNAME
-  [[ -z "$USERNAME" ]] && USERNAME="User"
+echo ""
+read -p "Имя пользователя (для метки): " USERNAME
+[[ -z "$USERNAME" ]] && USERNAME="User"
 
-  NEW_UUID=$(uuidgen)
+NEW_UUID=$(uuidgen)
 
-  if [[ "$TRANSPORT" == "tcp" ]]; then
-    NEW_CLIENT="{\"id\": \"${NEW_UUID}\", \"flow\": \"xtls-rprx-vision\"}"
-  else
-    NEW_CLIENT="{\"id\": \"${NEW_UUID}\"}"
-  fi
+if [[ "$TRANSPORT" == "tcp" ]]; then
+  NEW_CLIENT="{\"id\": \"${NEW_UUID}\", \"flow\": \"xtls-rprx-vision\"}"
+else
+  NEW_CLIENT="{\"id\": \"${NEW_UUID}\"}"
+fi
 
-  python3 - <<PYEOF
+python3 - <<PYEOF
 import json
 with open("$CONFIG") as f:
     config = json.load(f)
@@ -107,32 +123,53 @@ with open("$CONFIG", "w") as f:
     json.dump(config, f, indent=2)
 PYEOF
 
-  restart_xray
+xray run -test -config $CONFIG || { echo "Конфиг невалиден"; exit 1; }
+systemctl restart xray
+sleep 1
 
-  LINK=$(make_link "$NEW_UUID" "$USERNAME")
+if [[ "$TRANSPORT" == "tcp" ]]; then
+  LINK="vless://${NEW_UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${USERNAME}"
+else
+  LINK="vless://${NEW_UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=%2F#${USERNAME}"
+fi
 
-  echo ""
-  echo "════════════════════════════════════"
-  echo -e "${GREEN}   Пользователь добавлен!${NC}"
-  echo "════════════════════════════════════"
-  echo -e "Имя:  ${YELLOW}${USERNAME}${NC}"
-  echo -e "UUID: ${YELLOW}${NEW_UUID}${NC}"
-  echo ""
-  echo -e "VLESS ссылка:"
-  echo -e "${GREEN}${LINK}${NC}"
-  echo ""
-  echo "QR код:"
-  echo ""
-  qrencode -t ANSIUTF8 "$LINK"
-}
+echo ""
+echo "════════════════════════════════════"
+echo "      Пользователь добавлен!"
+echo "════════════════════════════════════"
+echo "Имя:  $USERNAME"
+echo "UUID: $NEW_UUID"
+echo ""
+echo "VLESS ссылка:"
+echo "$LINK"
+echo ""
+echo "QR код:"
+echo ""
+qrencode -t ANSIUTF8 "$LINK"
+EOF
 
-rmuser() {
-  [[ ! -f $CONFIG ]] && err "Xray не установлен"
-  userlist
-  read -p "Введи номер пользователя для удаления: " NUM
-  [[ -z "$NUM" ]] && err "Номер не введён"
+  # rmuser
+  cat > /usr/local/bin/rmuser <<'EOF'
+#!/bin/bash
+CONFIG="/usr/local/etc/xray/config.json"
+[[ ! -f $CONFIG ]] && echo "Xray не установлен" && exit 1
 
-  python3 - <<PYEOF
+echo ""
+echo "Список пользователей:"
+echo "────────────────────────────────────"
+python3 - <<PYEOF
+import json
+with open("$CONFIG") as f:
+    config = json.load(f)
+clients = config["inbounds"][0]["settings"]["clients"]
+for i, c in enumerate(clients):
+    print(f"  {i+1}) {c['id']}")
+PYEOF
+echo ""
+read -p "Введи номер пользователя для удаления: " NUM
+[[ -z "$NUM" ]] && echo "Номер не введён" && exit 1
+
+python3 - <<PYEOF
 import json, sys
 with open("$CONFIG") as f:
     config = json.load(f)
@@ -147,20 +184,39 @@ with open("$CONFIG", "w") as f:
     json.dump(config, f, indent=2)
 PYEOF
 
-  restart_xray
-  log "Пользователь удалён"
-}
+xray run -test -config $CONFIG || { echo "Конфиг невалиден"; exit 1; }
+systemctl restart xray
+sleep 1
+echo "Готово"
+EOF
 
-sharelink() {
-  [[ ! -f $CONFIG ]] && err "Xray не установлен"
-  [[ ! -f $PARAMS ]] && err "Файл параметров не найден, переустанови сервер"
-  userlist
-  read -p "Введи номер пользователя: " NUM
-  [[ -z "$NUM" ]] && err "Номер не введён"
-  read -p "Имя для метки [User]: " USERNAME
-  USERNAME=${USERNAME:-User}
+  # sharelink
+  cat > /usr/local/bin/sharelink <<'EOF'
+#!/bin/bash
+CONFIG="/usr/local/etc/xray/config.json"
+PARAMS="/usr/local/etc/xray/params.env"
+[[ ! -f $CONFIG ]] && echo "Xray не установлен" && exit 1
+[[ ! -f $PARAMS ]] && echo "Файл параметров не найден" && exit 1
+source $PARAMS
 
-  UUID=$(python3 - <<PYEOF
+echo ""
+echo "Список пользователей:"
+echo "────────────────────────────────────"
+python3 - <<PYEOF
+import json
+with open("$CONFIG") as f:
+    config = json.load(f)
+clients = config["inbounds"][0]["settings"]["clients"]
+for i, c in enumerate(clients):
+    print(f"  {i+1}) {c['id']}")
+PYEOF
+echo ""
+read -p "Введи номер пользователя: " NUM
+[[ -z "$NUM" ]] && echo "Номер не введён" && exit 1
+read -p "Имя для метки [User]: " USERNAME
+USERNAME=${USERNAME:-User}
+
+UUID=$(python3 - <<PYEOF
 import json
 with open("$CONFIG") as f:
     config = json.load(f)
@@ -170,128 +226,114 @@ print(clients[idx]["id"])
 PYEOF
 )
 
-  LINK=$(make_link "$UUID" "$USERNAME")
+if [[ "$TRANSPORT" == "tcp" ]]; then
+  LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${USERNAME}"
+else
+  LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=%2F#${USERNAME}"
+fi
 
-  echo ""
-  echo "════════════════════════════════════"
-  echo -e "${CYAN}      Ссылка для подключения${NC}"
-  echo "════════════════════════════════════"
-  echo -e "VLESS ссылка:"
-  echo -e "${GREEN}${LINK}${NC}"
-  echo ""
-  echo "QR код:"
-  echo ""
-  qrencode -t ANSIUTF8 "$LINK"
-}
+echo ""
+echo "════════════════════════════════════"
+echo "      Ссылка для подключения"
+echo "════════════════════════════════════"
+echo "VLESS ссылка:"
+echo "$LINK"
+echo ""
+echo "QR код:"
+echo ""
+qrencode -t ANSIUTF8 "$LINK"
+EOF
 
-menu() {
-  echo ""
-  echo "════════════════════════════════════"
-  echo -e "${CYAN}         Управление Xray${NC}"
-  echo "════════════════════════════════════"
-  echo "  1) userlist  — список пользователей"
-  echo "  2) mainuser  — ссылка основного пользователя"
-  echo "  3) newuser   — добавить пользователя"
-  echo "  4) rmuser    — удалить пользователя"
-  echo "  5) sharelink — ссылка для любого пользователя"
-  echo "  6) Выход"
-  echo "════════════════════════════════════"
-  read -p "Выбери действие: " ACTION
-  case $ACTION in
-    1) userlist ;;
-    2) mainuser ;;
-    3) newuser ;;
-    4) rmuser ;;
-    5) sharelink ;;
-    6) exit 0 ;;
-    *) err "Неверный выбор" ;;
-  esac
+  chmod +x /usr/local/bin/userlist
+  chmod +x /usr/local/bin/mainuser
+  chmod +x /usr/local/bin/newuser
+  chmod +x /usr/local/bin/rmuser
+  chmod +x /usr/local/bin/sharelink
+
+  log "Команды установлены"
 }
 
 # ─── Установка ───────────────────────────────────────────
 
-install() {
-  [[ $EUID -ne 0 ]] && err "Запусти от root"
+[[ $EUID -ne 0 ]] && err "Запусти от root"
 
-  log "Устанавливаю зависимости..."
-  apt-get update -qq
-  apt-get install -y -qq curl unzip uuid-runtime qrencode
+log "Устанавливаю зависимости..."
+apt-get update -qq
+apt-get install -y -qq curl unzip uuid-runtime qrencode python3
 
-  log "Устанавливаю xray..."
-  bash <(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+log "Устанавливаю xray..."
+bash <(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
 
-  echo ""
-  echo "════════════════════════════════════"
-  echo "       Настройка VLESS + Reality    "
-  echo "════════════════════════════════════"
-  echo ""
+echo ""
+echo "════════════════════════════════════"
+echo "       Настройка VLESS + Reality    "
+echo "════════════════════════════════════"
+echo ""
 
-  read -p "Порт [443]: " PORT
-  PORT=${PORT:-443}
+read -p "Порт [443]: " PORT
+PORT=${PORT:-443}
 
-  # Проверяем что порт свободен
-  if ss -tlnp | grep -q ":${PORT} " ; then
-    BUSY_BY=$(ss -tlnp | grep ":${PORT} " | awk '{print $NF}')
-    err "Порт ${PORT} уже занят: ${BUSY_BY}. Останови процесс или выбери другой порт."
-  fi
+if ss -tlnp | grep -q ":${PORT} "; then
+  BUSY_BY=$(ss -tlnp | grep ":${PORT} " | awk '{print $NF}')
+  err "Порт ${PORT} уже занят: ${BUSY_BY}"
+fi
 
-  read -p "SNI (например, www.google.com): " SNI
-  [[ -z "$SNI" ]] && err "SNI не может быть пустым"
+read -p "SNI (например, www.google.com): " SNI
+[[ -z "$SNI" ]] && err "SNI не может быть пустым"
 
-  # Проверяем доступность SNI
-  log "Проверяю доступность SNI..."
-  if ! curl -sI --max-time 5 "https://${SNI}" > /dev/null 2>&1; then
-    echo -e "${YELLOW}[!]${NC} SNI ${SNI} недоступен с этого сервера. Продолжить всё равно? [y/N]"
-    read -p "" CONFIRM
-    [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && err "Прерываем установку. Выбери другой SNI."
-  fi
+log "Проверяю доступность SNI..."
+if ! curl -sI --max-time 5 "https://${SNI}" > /dev/null 2>&1; then
+  echo -e "${YELLOW}[!]${NC} SNI ${SNI} недоступен с этого сервера. Продолжить? [y/N]"
+  read -p "" CONFIRM
+  [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && err "Прерываем. Выбери другой SNI."
+fi
 
-  echo ""
-  echo "Доступные отпечатки:"
-  echo "  1) chrome"
-  echo "  2) firefox"
-  echo "  3) safari"
-  echo "  4) edge"
-  echo "  5) ios"
-  echo "  6) android"
-  echo "  7) random"
-  read -p "Выбери отпечаток [1]: " FP_CHOICE
-  case $FP_CHOICE in
-    2) FINGERPRINT="firefox" ;;
-    3) FINGERPRINT="safari" ;;
-    4) FINGERPRINT="edge" ;;
-    5) FINGERPRINT="ios" ;;
-    6) FINGERPRINT="android" ;;
-    7) FINGERPRINT="random" ;;
-    *) FINGERPRINT="chrome" ;;
-  esac
+echo ""
+echo "Доступные отпечатки:"
+echo "  1) chrome"
+echo "  2) firefox"
+echo "  3) safari"
+echo "  4) edge"
+echo "  5) ios"
+echo "  6) android"
+echo "  7) random"
+read -p "Выбери отпечаток [1]: " FP_CHOICE
+case $FP_CHOICE in
+  2) FINGERPRINT="firefox" ;;
+  3) FINGERPRINT="safari" ;;
+  4) FINGERPRINT="edge" ;;
+  5) FINGERPRINT="ios" ;;
+  6) FINGERPRINT="android" ;;
+  7) FINGERPRINT="random" ;;
+  *) FINGERPRINT="chrome" ;;
+esac
 
-  echo ""
-  echo "Транспортный протокол:"
-  echo "  1) tcp"
-  echo "  2) xhttp"
-  read -p "Выбери транспорт [1]: " TR_CHOICE
-  case $TR_CHOICE in
-    2) TRANSPORT="xhttp" ;;
-    *) TRANSPORT="tcp" ;;
-  esac
+echo ""
+echo "Транспортный протокол:"
+echo "  1) tcp"
+echo "  2) xhttp"
+read -p "Выбери транспорт [1]: " TR_CHOICE
+case $TR_CHOICE in
+  2) TRANSPORT="xhttp" ;;
+  *) TRANSPORT="tcp" ;;
+esac
 
-  log "Генерирую ключи..."
-  UUID=$(uuidgen)
+log "Генерирую ключи..."
+UUID=$(uuidgen)
 
-  KEYS=$(xray x25519)
-  PRIVATE_KEY=$(echo "$KEYS" | awk 'NR==1{print $NF}')
-  PUBLIC_KEY=$(echo "$KEYS"  | awk 'NR==2{print $NF}')
+KEYS=$(xray x25519)
+PRIVATE_KEY=$(echo "$KEYS" | awk 'NR==1{print $NF}')
+PUBLIC_KEY=$(echo "$KEYS"  | awk 'NR==2{print $NF}')
 
-  [[ -z "$PRIVATE_KEY" ]] && err "Не удалось получить приватный ключ. Вывод:\n$KEYS"
-  [[ -z "$PUBLIC_KEY"  ]] && err "Не удалось получить публичный ключ. Вывод:\n$KEYS"
+[[ -z "$PRIVATE_KEY" ]] && err "Не удалось получить приватный ключ. Вывод:\n$KEYS"
+[[ -z "$PUBLIC_KEY"  ]] && err "Не удалось получить публичный ключ. Вывод:\n$KEYS"
 
-  SHORT_ID=$(openssl rand -hex 8)
-  SERVER_IP=$(curl -s https://api.ipify.org)
+SHORT_ID=$(openssl rand -hex 8)
+SERVER_IP=$(curl -s https://api.ipify.org)
 
-  if [[ "$TRANSPORT" == "xhttp" ]]; then
-    CLIENT_BLOCK='{"id": "'"${UUID}"'"}'
-    STREAM_SETTINGS=$(cat <<EOF
+if [[ "$TRANSPORT" == "xhttp" ]]; then
+  CLIENT_BLOCK='{"id": "'"${UUID}"'"}'
+  STREAM_SETTINGS=$(cat <<EOF
 {
   "network": "xhttp",
   "security": "reality",
@@ -309,10 +351,10 @@ install() {
 }
 EOF
 )
-    VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=%2F#MyServer"
-  else
-    CLIENT_BLOCK='{"id": "'"${UUID}"'", "flow": "xtls-rprx-vision"}'
-    STREAM_SETTINGS=$(cat <<EOF
+  VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=%2F#MyServer"
+else
+  CLIENT_BLOCK='{"id": "'"${UUID}"'", "flow": "xtls-rprx-vision"}'
+  STREAM_SETTINGS=$(cat <<EOF
 {
   "network": "tcp",
   "security": "reality",
@@ -327,11 +369,11 @@ EOF
 }
 EOF
 )
-    VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#MyServer"
-  fi
+  VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#MyServer"
+fi
 
-  log "Записываю конфиг..."
-  cat > $CONFIG <<EOF
+log "Записываю конфиг..."
+cat > $CONFIG <<EOF
 {
   "log": {
     "loglevel": "warning"
@@ -365,7 +407,7 @@ EOF
 }
 EOF
 
-  cat > $PARAMS <<EOF
+cat > $PARAMS <<EOF
 PUBLIC_KEY=${PUBLIC_KEY}
 SHORT_ID=${SHORT_ID}
 SNI=${SNI}
@@ -375,74 +417,40 @@ FINGERPRINT=${FINGERPRINT}
 SERVER_IP=${SERVER_IP}
 EOF
 
-  log "Валидирую конфиг..."
-  xray run -test -config $CONFIG || err "Конфиг невалиден"
+log "Валидирую конфиг..."
+xray run -test -config $CONFIG || err "Конфиг невалиден"
 
-  log "Запускаю xray..."
-  systemctl enable xray
-  systemctl restart xray
-  sleep 2
-  systemctl is-active --quiet xray && log "Xray запущен успешно" || err "Xray не запустился"
+log "Запускаю xray..."
+systemctl enable xray
+systemctl restart xray
+sleep 2
+systemctl is-active --quiet xray && log "Xray запущен успешно" || err "Xray не запустился"
 
-  # Копируем скрипт глобально
-  cp "$0" /usr/local/bin/xray-manage
-  chmod +x /usr/local/bin/xray-manage
+install_commands
 
-  # Алиасы
-  cat >> /etc/bash.bashrc <<'BASHEOF'
-
-# xray management
-alias menu='xray-manage menu'
-alias userlist='xray-manage userlist'
-alias mainuser='xray-manage mainuser'
-alias newuser='xray-manage newuser'
-alias rmuser='xray-manage rmuser'
-alias sharelink='xray-manage sharelink'
-BASHEOF
-
-  source /etc/bash.bashrc
-
-  echo ""
-  echo "════════════════════════════════════"
-  echo -e "${GREEN}       Установка завершена!${NC}"
-  echo "════════════════════════════════════"
-  echo ""
-  echo -e "UUID:        ${YELLOW}${UUID}${NC}"
-  echo -e "Порт:        ${YELLOW}${PORT}${NC}"
-  echo -e "SNI:         ${YELLOW}${SNI}${NC}"
-  echo -e "Отпечаток:   ${YELLOW}${FINGERPRINT}${NC}"
-  echo -e "Транспорт:   ${YELLOW}${TRANSPORT}${NC}"
-  echo -e "Public key:  ${YELLOW}${PUBLIC_KEY}${NC}"
-  echo -e "Short ID:    ${YELLOW}${SHORT_ID}${NC}"
-  echo ""
-  echo -e "VLESS ссылка:"
-  echo -e "${GREEN}${VLESS_LINK}${NC}"
-  echo ""
-  echo "QR код:"
-  echo ""
-  qrencode -t ANSIUTF8 "$VLESS_LINK"
-  echo ""
-  echo -e "Доступные команды:"
-  echo -e "  ${CYAN}menu${NC}      — интерактивное меню"
-  echo -e "  ${CYAN}userlist${NC}  — список пользователей"
-  echo -e "  ${CYAN}mainuser${NC}  — ссылка основного пользователя"
-  echo -e "  ${CYAN}newuser${NC}   — добавить пользователя"
-  echo -e "  ${CYAN}rmuser${NC}    — удалить пользователя"
-  echo -e "  ${CYAN}sharelink${NC} — ссылка для любого пользователя"
-  echo ""
-  echo -e "${YELLOW}Выполни 'source /etc/bash.bashrc' чтобы команды заработали сразу${NC}"
-}
-
-# ─── Точка входа ─────────────────────────────────────────
-
-case "${1:-}" in
-  install)   install ;;
-  userlist)  userlist ;;
-  mainuser)  mainuser ;;
-  newuser)   newuser ;;
-  rmuser)    rmuser ;;
-  sharelink) sharelink ;;
-  menu)      menu ;;
-  "")        menu ;;
-  *) echo -e "Использование: xray-manage [install|userlist|mainuser|newuser|rmuser|sharelink|menu]" ;;
-esac
+echo ""
+echo "════════════════════════════════════"
+echo -e "${GREEN}       Установка завершена!${NC}"
+echo "════════════════════════════════════"
+echo ""
+echo -e "UUID:        ${YELLOW}${UUID}${NC}"
+echo -e "Порт:        ${YELLOW}${PORT}${NC}"
+echo -e "SNI:         ${YELLOW}${SNI}${NC}"
+echo -e "Отпечаток:   ${YELLOW}${FINGERPRINT}${NC}"
+echo -e "Транспорт:   ${YELLOW}${TRANSPORT}${NC}"
+echo -e "Public key:  ${YELLOW}${PUBLIC_KEY}${NC}"
+echo -e "Short ID:    ${YELLOW}${SHORT_ID}${NC}"
+echo ""
+echo -e "VLESS ссылка:"
+echo -e "${GREEN}${VLESS_LINK}${NC}"
+echo ""
+echo "QR код:"
+echo ""
+qrencode -t ANSIUTF8 "$VLESS_LINK"
+echo ""
+echo -e "Доступные команды:"
+echo -e "  ${CYAN}userlist${NC}  — список пользователей"
+echo -e "  ${CYAN}mainuser${NC}  — ссылка основного пользователя"
+echo -e "  ${CYAN}newuser${NC}   — добавить пользователя"
+echo -e "  ${CYAN}rmuser${NC}    — удалить пользователя"
+echo -e "  ${CYAN}sharelink${NC} — ссылка для любого пользователя"
