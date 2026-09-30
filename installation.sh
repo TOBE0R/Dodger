@@ -11,11 +11,17 @@
 # Необязательные переменные окружения:
 #   XRAY_VERSION=v26.3.27        зафиксировать версию Xray (по умолчанию — последняя)
 #   SERVER_ADDR=vpn.example.com  адрес в ссылках (по умолчанию — внешний IPv4)
+#   API_PORT=10085               порт gRPC API Xray (слушает только 127.0.0.1)
 #   FORCE_REINSTALL=y            переустановить поверх существующей установки (ключи и ссылки сменятся)
-#   HARDEN=y|n                   при обновлении применить hardening к существующему конфигу
+#   MIGRATE=y|n                  при обновлении: включить API/статистику и hardening в существующем конфиге
 #   SKIP_SNI_CHECK=y             не проверять SNI на TLS 1.3 + HTTP/2
+#   SKIP_ZABBIX=y                не ставить UserParameter для Zabbix agent
 #
 # Повторный запуск без FORCE_REINSTALL безопасен: обновит Xray и утилиты, пользователей не тронет.
+#
+# Безопасность API: gRPC API Xray не имеет аутентификации и слушает 127.0.0.1. Единственное, что
+# не пускает через него VPN-клиентов, — правило routing «geoip:private → block» в конфиге.
+# Не удаляй его: без него любой клиент сможет дойти до 127.0.0.1:API и добавлять пользователей.
 
 set -Eeuo pipefail
 umask 077
@@ -28,6 +34,8 @@ readonly CTL=/usr/local/bin/xrayctl
 readonly INSTALLER_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 readonly FINGERPRINTS=(chrome firefox safari edge ios android random)
 readonly TRANSPORTS=(tcp xhttp)
+readonly ZABBIX_DIRS=(/etc/zabbix/zabbix_agentd.d /etc/zabbix/zabbix_agent2.d)
+readonly ZABBIX_UNITS=(zabbix-agent zabbix-agent2)
 
 if [[ -t 1 ]]; then
   RED=$'\e[0;31m' GREEN=$'\e[0;32m' YELLOW=$'\e[1;33m' CYAN=$'\e[0;36m' NC=$'\e[0m'
@@ -149,12 +157,20 @@ health_check() {
   err "Xray не запустился или не слушает порт $PORT (лог выше)"
 }
 
+api_check() {
+  local out
+  out=$(xray api inboundusercount -s "127.0.0.1:$API_PORT" -t 5 -tag=vless-in 2>&1) \
+    || err "API Xray не отвечает на 127.0.0.1:$API_PORT:"$'\n'"$out"
+  log "API Xray отвечает (127.0.0.1:$API_PORT), статистика по пользователям включена"
+}
+
 start_xray() {
   log "Запускаю Xray..."
   systemctl enable xray >/dev/null 2>&1
   systemctl restart xray
   health_check
   log "Xray работает и слушает порт $PORT"
+  api_check
 }
 
 open_firewall() {
@@ -183,6 +199,38 @@ enable_bbr() {
   log "BBR включён"
 }
 
+# ─── Мониторинг (Zabbix agent) ───────────────────────────
+
+# Две проверки: unit активен и порт слушается. Порт зашивается в файл при установке/обновлении.
+# Абсолютные пути: у агента укороченный PATH. Все права — обычного пользователя zabbix.
+install_zabbix() {
+  local d u ss_bin sc_bin conf found=0
+  [[ ${SKIP_ZABBIX:-n} != y ]] || return 0
+  ss_bin=$(command -v ss) sc_bin=$(command -v systemctl)
+  conf=$(printf '%s\n' \
+    "# Управляется install-xray.sh (порт Xray: $PORT). Перезаписывается при обновлении." \
+    "UserParameter=xray.unit.active,$sc_bin is-active --quiet xray && echo 1 || echo 0" \
+    "UserParameter=xray.port.listen,$ss_bin -Htln 'sport = :$PORT' | grep -q . && echo 1 || echo 0")
+  for d in "${ZABBIX_DIRS[@]}"; do
+    [[ -d $d ]] || continue
+    printf '%s\n' "$conf" > "$d/userparameter_xray.conf"
+    chown root:root "$d/userparameter_xray.conf"
+    chmod 644 "$d/userparameter_xray.conf"
+    found=1
+  done
+  if ((!found)); then
+    warn "Zabbix agent не найден — пропускаю. Для ручной настройки добавь в конфиг агента:"
+    printf '%s\n' "$conf" | sed 1d >&2
+    return 0
+  fi
+  for u in "${ZABBIX_UNITS[@]}"; do
+    if systemctl is-active --quiet "$u"; then
+      systemctl restart "$u" && log "Перезапущен $u (подхватил ключи xray.*)"
+    fi
+  done
+  log "Zabbix: ключи xray.unit.active и xray.port.listen (шаблон: zabbix_template_xray.yaml)"
+}
+
 # ─── Параметры и ключи ───────────────────────────────────
 
 detect_ip() {
@@ -204,15 +252,24 @@ check_sni() {
   [[ $v == 2 ]]
 }
 
+# check_port_free <порт> <название>: порт свободен или занят самим xray (переустановка)
+check_port_free() {
+  local holder
+  [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (($1 <= 65535)) || err "Некорректный порт ($2): $1"
+  holder=$(ss -Htlnp "sport = :$1")
+  if [[ -n $holder && $holder != *'"xray"'* ]]; then
+    err "Порт $1 ($2) уже занят: $(awk '{print $NF}' <<<"$holder" | sort -u | paste -sd' ')"
+  fi
+}
+
 collect_params() {
-  local holder detected=''
+  local detected=''
 
   ask PORT "Порт" 443
-  [[ $PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((PORT <= 65535)) || err "Некорректный порт: $PORT"
-  holder=$(ss -Htlnp "sport = :$PORT")
-  if [[ -n $holder && $holder != *'"xray"'* ]]; then
-    err "Порт $PORT уже занят: $(awk '{print $NF}' <<<"$holder" | sort -u | paste -sd' ')"
-  fi
+  check_port_free "$PORT" "Xray"
+  API_PORT=${API_PORT:-10085}
+  check_port_free "$API_PORT" "API"
+  [[ $API_PORT != "$PORT" ]] || err "API_PORT не может совпадать с PORT"
 
   ask SNI "SNI (чужой домен с TLS 1.3 + HTTP/2, не google.com)" ""
   [[ -n $SNI ]] || err "SNI обязателен (для запуска без вопросов задай SNI=домен)"
@@ -259,11 +316,18 @@ write_config() {
   tmp=$(mktemp --suffix=.json -p "$XRAY_DIR" .config.XXXXXX)
   TMP_FILES+=("$tmp")
   jq -n \
-    --argjson port "$PORT" --arg sni "$SNI" --arg net "$TRANSPORT" \
+    --argjson port "$PORT" --argjson api "$API_PORT" --arg sni "$SNI" --arg net "$TRANSPORT" \
     --arg pk "$PRIVATE_KEY" --arg sid "$SHORT_ID" --arg uuid "$UUID" '
     ($net == "tcp") as $tcp
     | {
         log: {loglevel: "warning", access: "none"},
+        # gRPC API напрямую на loopback (без dokodemo-inbound и routing-правила) + статистика
+        stats: {},
+        api: {tag: "api", listen: "127.0.0.1:\($api)", services: ["HandlerService", "StatsService"]},
+        policy: {
+          levels: {"0": {statsUserUplink: true, statsUserDownlink: true}},
+          system: {statsInboundUplink: true, statsInboundDownlink: true}
+        },
         inbounds: [{
           tag: "vless-in",
           listen: "0.0.0.0",
@@ -330,8 +394,13 @@ install_ctl() {
   cat > "$tmp" <<'XRAYCTL'
 #!/usr/bin/env bash
 # xrayctl — управление пользователями VLESS + REALITY (ставится install-xray.sh)
+#
+# Пользователи добавляются и удаляются «на лету» через gRPC API Xray (xray api adu/rmu),
+# без перезапуска и без обрыва чужих сессий. Конфиг на диске обновляется в любом случае,
+# поэтому после рестарта/ребута всё на месте. Если API недоступен — откат на обычный рестарт.
 set -Eeuo pipefail
 umask 077
+export LC_ALL=C.UTF-8   # длина строк считается в символах, а не в байтах (выравнивание кириллицы)
 
 readonly XRAY_DIR=/usr/local/etc/xray
 readonly CONFIG=$XRAY_DIR/config.json
@@ -340,34 +409,43 @@ readonly BACKUP_DIR=$XRAY_DIR/backup
 readonly KEEP_BACKUPS=20
 readonly LOCK_FILE=/run/xrayctl.lock
 
-# Первый VLESS-инбаунд; работает и с конфигами старой версии скрипта (без tag)
+# Первый VLESS-инбаунд; работает и с конфигами старых версий скрипта
 readonly JQ_DEFS='
   def ib: .inbounds | map(.protocol) | index("vless");
   def clients: .inbounds[ib].settings.clients;
 '
 
-TMP=''
+TMPS=()
 LOCKED=''
-CHANGED=''
-trap '[[ -z $TMP ]] || rm -f -- "$TMP"' EXIT
+CHANGED=0
+BACKUP=''
+API=''
+TAG=''
+trap 'if ((${#TMPS[@]})); then rm -f -- "${TMPS[@]}"; fi' EXIT
 
 die() { echo "Ошибка: $*" >&2; exit 1; }
+
+kv() {  # kv <ключ> <значение> — строка «ключ: значение» с выравниванием по символам
+  local pad=$((18 - ${#1}))
+  printf '%s%*s %s\n' "$1" "$((pad > 0 ? pad : 0))" '' "$2"
+}
 
 usage() {
   cat <<EOF
 Использование: xrayctl <команда> [аргументы]
 
   list                   список пользователей
-  add [имя]              добавить пользователя, показать ссылку и QR
-  rm [№|имя|uuid]        удалить пользователя
+  add [имя]              добавить пользователя (без перезапуска Xray), показать ссылку и QR
+  rm [-k] [№|имя|uuid]   удалить пользователя; -k — ещё и оборвать его активные сессии (рестарт)
   link [№|имя|uuid]      ссылка и QR для пользователя
   main                   ссылка основного пользователя
-  status                 состояние сервиса
-  harden                 применить рекомендуемые настройки безопасности к текущему конфигу
+  stats [--reset]        трафик по пользователям с момента запуска Xray (--reset обнуляет счётчики)
+  status                 состояние: unit, порт, API (код возврата 1, если unit или порт не в порядке)
+  restart                перезапустить Xray с проверкой (сбросит все активные сессии)
+  migrate                включить в существующем конфиге API, статистику и hardening (один рестарт)
 
-Без аргумента add/rm/link спросят интерактивно.
-Не печатать QR: NOQR=1 xrayctl link 2
-Старые команды userlist/newuser/rmuser/sharelink/mainuser работают как алиасы.
+Без аргумента add/rm/link спросят интерактивно. Не печатать QR: NOQR=1 xrayctl link 2
+Старые команды userlist/newuser/rmuser/sharelink/mainuser работают как алиасы; harden = migrate.
 EOF
 }
 
@@ -383,6 +461,13 @@ load() {
     [[ -n ${!v:-} ]] || die "в $PARAMS не задан $v"
   done
   jq -e "$JQ_DEFS ib != null" "$CONFIG" >/dev/null || die "в $CONFIG нет VLESS-инбаунда"
+  load_api
+}
+
+# Адрес API и тег инбаунда берутся из самого конфига — единственный источник правды
+load_api() {
+  API=$(q '.api.listen // empty')
+  TAG=$(q '.inbounds[ib].tag // empty')
 }
 
 # q <jq-фильтр> [аргументы jq] — запрос к конфигу
@@ -415,7 +500,7 @@ resolve() {
 }
 
 email_of() {
-  q 'first(clients[] | select(.id == $id) | .email // $def)' --arg id "$1" --arg def "${2:-User}"
+  q 'first(clients[] | select(.id == $id) | .email // $def)' --arg id "$1" --arg def "${2-User}"
 }
 
 # pick "<аргумент>" "<подсказка>" → UUID; без аргумента спрашивает интерактивно
@@ -453,48 +538,100 @@ show_link() {  # show_link <uuid> <метка> <заголовок>
   if [[ ${NOQR:-0} != 1 ]]; then qrencode -t ANSIUTF8 "$link"; fi
 }
 
+# ─── Состояние сервиса ───────────────────────────────────
+
+port_listening() { [[ -n $(ss -Htln "sport = :$PORT") ]]; }
+
 healthy() {
   local _
   sleep 2
   for _ in 1 2 3 4 5; do
-    if systemctl is-active --quiet xray && [[ -n $(ss -Htln "sport = :$PORT") ]]; then return 0; fi
+    if systemctl is-active --quiet xray && port_listening; then return 0; fi
     sleep 1
   done
   return 1
 }
 
-# apply <jq-фильтр> [аргументы jq] — транзакционное изменение конфига:
-# новый конфиг во временный файл → xray -test → бэкап → атомарная замена → рестарт → откат при сбое
-apply() {
-  local filter=$1 out backup
+api_up() {
+  [[ -n $API && -n $TAG ]] || return 1
+  xray api inboundusercount -s "$API" -t 3 -tag="$TAG" >/dev/null 2>&1
+}
+
+api_count() {
+  xray api inboundusercount -s "$API" -t 3 -tag="$TAG" 2>/dev/null | jq -r '.count // 0'
+}
+
+# ─── Изменение конфига ───────────────────────────────────
+
+# apply_config <jq-фильтр> [аргументы jq] — только конфиг на диске, без рестарта:
+# новый конфиг во временный файл → xray -test → бэкап → атомарная замена.
+# CHANGED=1, если что-то изменилось; BACKUP — путь к копии прежнего конфига.
+apply_config() {
+  local filter=$1 newcfg out
   shift
   lock
-  TMP=$(mktemp --suffix=.json -p "$XRAY_DIR" .config.XXXXXX)
-  jq "$@" "$JQ_DEFS $filter" "$CONFIG" > "$TMP"
-  if jq -e --slurpfile old "$CONFIG" '. == $old[0]' "$TMP" >/dev/null; then
-    echo "Конфиг уже в нужном состоянии, изменений нет"
-    return 0
-  fi
-  out=$(xray run -test -config "$TMP" 2>&1) \
+  CHANGED=0
+  newcfg=$(mktemp --suffix=.json -p "$XRAY_DIR" .config.XXXXXX)
+  TMPS+=("$newcfg")
+  jq "$@" "$JQ_DEFS $filter" "$CONFIG" > "$newcfg"
+  if jq -e --slurpfile old "$CONFIG" '. == $old[0]' "$newcfg" >/dev/null; then return 0; fi
+  out=$(xray run -test -config "$newcfg" 2>&1) \
     || die "новый конфиг не прошёл проверку, ничего не изменено:"$'\n'"$out"
-  chown --reference="$CONFIG" "$TMP"
-  chmod --reference="$CONFIG" "$TMP"
+  chown --reference="$CONFIG" "$newcfg"
+  chmod --reference="$CONFIG" "$newcfg"
   install -d -m 700 "$BACKUP_DIR"
-  backup="$BACKUP_DIR/config.$(date +%Y%m%d-%H%M%S).$$.json"
-  cp -p "$CONFIG" "$backup"
-  mv -f "$TMP" "$CONFIG"
-  TMP=''
-  systemctl restart xray || true
-  if ! healthy; then
-    journalctl -u xray -n 20 --no-pager >&2 || true
-    cp -p "$backup" "$CONFIG"
-    systemctl restart xray || true
-    die "Xray не поднялся с новым конфигом — восстановлен $backup"
-  fi
+  BACKUP="$BACKUP_DIR/config.$(date +%Y%m%d-%H%M%S).$$.json"
+  cp -p "$CONFIG" "$BACKUP"
+  mv -f "$newcfg" "$CONFIG"
+  CHANGED=1
   find "$BACKUP_DIR" -maxdepth 1 -name 'config.*.json' ! -name 'config.pre-reinstall.*' -printf '%T@ %p\n' \
     | sort -rn | tail -n +$((KEEP_BACKUPS + 1)) | cut -d' ' -f2- | xargs -r rm -f --
-  CHANGED=1
 }
+
+# Рестарт с проверкой; если Xray не поднялся — возвращаем прежний конфиг и падаем
+restart_or_rollback() {
+  systemctl restart xray || true
+  if healthy; then return 0; fi
+  journalctl -u xray -n 20 --no-pager >&2 || true
+  if [[ -n $BACKUP ]]; then
+    cp -p "$BACKUP" "$CONFIG"
+    systemctl restart xray || true
+    die "Xray не поднялся с новым конфигом — восстановлен $BACKUP"
+  fi
+  die "Xray не поднялся"
+}
+
+# ─── Горячее обновление пользователей через API ──────────
+# ВАЖНО: `xray api adu/rmu` возвращают код 0 даже при провале («Added 0 user(s)»),
+# поэтому результат всегда проверяется отдельным запросом inbounduser.
+
+runtime_user() {  # runtime_user <email> → JSON ответа inbounduser
+  xray api inbounduser -s "$API" -t 5 -tag="$TAG" -email="$1" 2>/dev/null
+}
+
+runtime_add() {  # runtime_add <uuid> <email> <flow|''>
+  local f
+  [[ -n $API && -n $TAG ]] || return 1
+  f=$(mktemp)
+  TMPS+=("$f")
+  # port нужен только парсеру xray (адреса/порты adu не использует)
+  jq -n --arg tag "$TAG" --argjson port "$PORT" --arg id "$1" --arg email "$2" --arg flow "$3" '
+    {inbounds: [{tag: $tag, port: $port, protocol: "vless",
+      settings: {clients: [{id: $id, email: $email} + (if $flow == "" then {} else {flow: $flow} end)],
+                 decryption: "none"}}]}' > "$f"
+  xray api adu -s "$API" -t 5 "$f" >/dev/null 2>&1 || true
+  runtime_user "$2" | jq -e --arg id "$1" '.users[0].account.id == $id' >/dev/null
+}
+
+runtime_rm() {  # runtime_rm <email>
+  local out
+  [[ -n $API && -n $TAG && -n ${1:-} ]] || return 1
+  xray api rmu -s "$API" -t 5 -tag="$TAG" "$1" >/dev/null 2>&1 || true
+  out=$(runtime_user "$1") || return 1
+  jq -e '(.users[0].email // "") == ""' <<<"$out" >/dev/null
+}
+
+# ─── Команды ─────────────────────────────────────────────
 
 cmd_list() {
   local n id email
@@ -507,35 +644,60 @@ cmd_list() {
 }
 
 cmd_add() {
-  local name=${1:-} id flow=''
-  local re='^[^[:space:][:cntrl:]"\\]{1,32}$'
+  local name=${1:-} id flow='' how
+  # 1–32 символа; без пробелов, кавычек, '\', '>' (разделитель имён статистики) и '-' в начале
+  local re='^[^[:space:][:cntrl:]"\\>-][^[:space:][:cntrl:]"\\>]{0,31}$'
   if [[ -z $name ]]; then
     [[ -t 0 ]] || die "укажи имя: xrayctl add <имя>"
     read -rp "Имя пользователя (без пробелов): " name
   fi
-  [[ $name =~ $re ]] || die "имя: 1–32 символа, без пробелов, кавычек и обратного слэша"
+  [[ $name =~ $re ]] || die "имя: 1–32 символа, без пробелов, кавычек, '\\', '>' и без '-' в начале"
   [[ ! $name =~ ^[0-9]+$ ]] || die "имя не может состоять только из цифр (путается с номером)"
   lock
   [[ -z $(resolve "$name") ]] || die "пользователь '$name' уже существует"
   id=$(xray uuid)
   if [[ $TRANSPORT == tcp ]]; then flow=xtls-rprx-vision; fi
-  apply 'clients += [{id: $id, email: $email} + (if $flow == "" then {} else {flow: $flow} end)]' \
+  apply_config 'clients += [{id: $id, email: $email} + (if $flow == "" then {} else {flow: $flow} end)]' \
     --arg id "$id" --arg email "$name" --arg flow "$flow"
-  show_link "$id" "$name" "Пользователь добавлен"
+  if runtime_add "$id" "$name" "$flow"; then
+    how="добавлен без перезапуска Xray"
+  else
+    echo "API не принял пользователя — перезапускаю Xray" >&2
+    restart_or_rollback
+    how="добавлен, Xray перезапущен"
+  fi
+  show_link "$id" "$name" "Пользователь $how"
 }
 
 cmd_rm() {
-  local id name
+  local key='' kick=0 a id name
+  for a in "$@"; do
+    case $a in
+      -k | --kick) kick=1 ;;
+      *) key=$a ;;
+    esac
+  done
   lock
-  id=$(pick "${1:-}" "Номер, имя или UUID для удаления")
-  name=$(email_of "$id" "-")
+  id=$(pick "$key" "Номер, имя или UUID для удаления")
+  name=$(email_of "$id" "")
   (($(q 'clients | length') > 1)) || die "нельзя удалить последнего пользователя"
-  if [[ -z ${1:-} ]] && ! confirm "Удалить '$name' ($id)?"; then
+  if [[ -z $key ]] && ! confirm "Удалить '${name:-$id}' ($id)?"; then
     echo "Отменено"
     return 0
   fi
-  apply 'clients |= map(select(.id != $id))' --arg id "$id"
-  echo "Удалён: $name ($id)"
+  apply_config 'clients |= map(select(.id != $id))' --arg id "$id"
+  if ((kick)); then
+    restart_or_rollback
+    echo "Удалён: ${name:-$id}. Xray перезапущен — все активные сессии сброшены."
+  elif runtime_rm "$name"; then
+    echo "Удалён без перезапуска: ${name:-$id}"
+    echo "Внимание: новые подключения отклоняются, но уже открытые сессии работают до своего закрытия."
+    echo "Оборвать их сейчас: xrayctl restart (сбросит сессии ВСЕХ пользователей)."
+  else
+    echo "API недоступен или у пользователя нет имени (старый формат) — перезапускаю Xray" >&2
+    restart_or_rollback
+    echo "Удалён: ${name:-$id}. Xray перезапущен."
+  fi
 }
 
 cmd_link() {
@@ -552,32 +714,131 @@ cmd_main() {
   show_link "$id" "$(email_of "$id" MainUser)" "Основной пользователь"
 }
 
-cmd_status() {
-  local listening='нет'
-  if [[ -n $(ss -Htln "sport = :$PORT") ]]; then listening='да'; fi
+cmd_stats() {
+  local reset=() raw users
+  case ${1:-} in
+    -r | --reset) reset=(-reset) ;;
+    '') ;;
+    *) die "использование: xrayctl stats [--reset]" ;;
+  esac
+  [[ -n $API ]] || die "API не включён в конфиге — выполни: xrayctl migrate"
+  raw=$(xray api statsquery -s "$API" -t 5 -pattern '>>>traffic>>>' ${reset[@]+"${reset[@]}"} 2>&1) \
+    || die "API не отвечает: $raw"
+  users=$(q '[clients[] | .email // .id]')
   echo
-  echo "Версия:        $(xray version | sed -n 1p)"
-  echo "Сервис:        $(systemctl is-active xray || true)"
-  echo "Порт $PORT:     слушается — $listening"
-  echo "Транспорт:     $TRANSPORT, SNI $SNI, fp $FINGERPRINT"
-  echo "Пользователей: $(q 'clients | length')"
+  jq -r --argjson users "$users" '
+    def human:
+      if . >= 1099511627776 then (. / 1099511627776 * 100 | round / 100 | tostring) + " TiB"
+      elif . >= 1073741824 then (. / 1073741824 * 100 | round / 100 | tostring) + " GiB"
+      elif . >= 1048576    then (. / 1048576 * 100 | round / 100 | tostring) + " MiB"
+      elif . >= 1024       then (. / 1024 * 100 | round / 100 | tostring) + " KiB"
+      else tostring + " B" end;
+    def pad($n): . + (reduce range(0; ([$n - length, 0] | max)) as $_ (""; . + " "));
+    def table:
+      . as $t
+      | ($t | transpose | map(map(length) | max)) as $w
+      | $t[] | [range(0; length) as $i | .[$i] | pad($w[$i])] | join("  ");
+    def total($s; $u; $d): [$s[] | select(.k == "user" and .n == $u and .d == $d) | .v] | add // 0;
+    ([.stat[]? | (.name | split(">>>")) as $p
+       | {k: $p[0], n: $p[1], d: $p[3], v: ((.value // 0) | tonumber)}]) as $s
+    | ($users
+       | map({u: ., up: total($s; .; "uplink"), down: total($s; .; "downlink")} | . + {sum: (.up + .down)})
+       | sort_by(-.sum)) as $rows
+    | ([["ПОЛЬЗОВАТЕЛЬ", "UPLOAD", "DOWNLOAD", "ВСЕГО"]]
+        + [$rows[] | [.u, (.up | human), (.down | human), (.sum | human)]]
+        + [["ИТОГО", ($rows | map(.up) | add // 0 | human), ($rows | map(.down) | add // 0 | human),
+            ($rows | map(.sum) | add // 0 | human)]]) | table' <<<"$raw"
+  echo
+  if [[ ${reset[0]:-} == -reset ]]; then
+    echo "Счётчики обнулены."
+  else
+    echo "Счётчики копятся с момента запуска Xray и обнуляются при его рестарте."
+  fi
   echo
 }
 
-cmd_harden() {
-  apply '
-    .log.access = "none"
+cmd_status() {
+  local unit port_state rc=0 api_state cfg_n rt_n=''
+  unit=$(systemctl is-active xray 2>/dev/null || true)
+  [[ $unit == active ]] || rc=1
+  if port_listening; then port_state='слушается'; else port_state='НЕ слушается'; rc=1; fi
+  cfg_n=$(q 'clients | length')
+  if api_up; then
+    rt_n=$(api_count)
+    api_state="отвечает ($API)"
+  elif [[ -n $API ]]; then
+    api_state="НЕ отвечает ($API)"
+  else
+    api_state='не включён — xrayctl migrate'
+  fi
+  echo
+  kv 'Версия:' "$(xray version | sed -n 1p)"
+  kv 'Unit xray:' "${unit:-неизвестно}"
+  kv "Порт $PORT:" "$port_state"
+  kv 'API:' "$api_state"
+  kv 'Транспорт:' "$TRANSPORT, SNI $SNI, fp $FINGERPRINT"
+  kv 'Пользователей:' "$cfg_n"
+  if [[ -n $rt_n && $rt_n != "$cfg_n" ]]; then
+    echo "Внимание: в работающем Xray пользователей $rt_n, в конфиге $cfg_n — выполни xrayctl restart"
+  fi
+  echo
+  return "$rc"
+}
+
+cmd_restart() {
+  lock
+  BACKUP=''
+  restart_or_rollback
+  echo "Xray перезапущен, активные сессии сброшены."
+}
+
+# Приводит существующий конфиг к актуальному виду: имена (email) у всех пользователей,
+# gRPC API на loopback, статистика по пользователям, блокировка приватных сетей и BitTorrent.
+cmd_migrate() {
+  local listen holder port=${API_PORT:-10085}
+  listen=$(q '.api.listen // empty')
+  if [[ -z $listen ]]; then
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || die "некорректный API_PORT: $port"
+    [[ $port != "$PORT" ]] || die "API_PORT совпадает с портом Xray"
+    holder=$(ss -Htlnp "sport = :$port")
+    if [[ -n $holder && $holder != *'"xray"'* ]]; then die "порт $port под API уже занят: задай другой через API_PORT=..."; fi
+    listen="127.0.0.1:$port"
+  fi
+  apply_config '
+    .inbounds[ib].tag //= "vless-in"
+    | .inbounds[ib].settings.clients |= (
+        . as $all
+        | to_entries
+        | map(.value + (
+            if ((.value.email // "") | length) > 0 then {}
+            else {email: (if .key == 0 and (($all | map(.email // "") | index("main")) == null)
+                          then "main" else "user-" + .value.id[0:8] end)}
+            end)))
+    | .stats //= {}
+    | .api = {tag: "api", listen: (.api.listen // $listen), services: ["HandlerService", "StatsService"]}
+    | .policy.levels["0"].statsUserUplink = true
+    | .policy.levels["0"].statsUserDownlink = true
+    | .policy.system.statsInboundUplink = true
+    | .policy.system.statsInboundDownlink = true
+    | .log.access = "none"
     | .inbounds[ib].sniffing = {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
-    | if any(.outbounds[]; .tag == "block") then . else .outbounds += [{protocol: "blackhole", tag: "block"}] end
+    | if any(.outbounds[]?; .tag == "block") then . else .outbounds += [{protocol: "blackhole", tag: "block"}] end
     | .routing.domainStrategy = "IPIfNonMatch"
     | .routing.rules = ($rules + ((.routing.rules // []) - $rules))' \
+    --arg listen "$listen" \
     --argjson rules '[
       {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
       {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
     ]'
-  if [[ -n $CHANGED ]]; then
-    echo "Hardening применён: приватные сети сервера и BitTorrent закрыты, access-лог выключен"
+  load_api
+  if ((CHANGED)) || ! api_up; then
+    echo "Перезапускаю Xray (один раз, активные сессии переподключатся)..."
+    restart_or_rollback
+  else
+    echo "Конфиг уже в нужном состоянии, перезапуск не нужен."
   fi
+  api_up || die "API не отвечает на $API после миграции"
+  echo "Готово: API $API, статистика по пользователям включена, приватные сети и BitTorrent закрыты."
 }
 
 case ${0##*/} in
@@ -591,13 +852,15 @@ esac
 cmd=${1:-help}
 shift || true
 case $cmd in
-  list | ls)    load; cmd_list ;;
-  add | new)    load; cmd_add "$@" ;;
-  rm | del)     load; cmd_rm "$@" ;;
-  link | share) load; cmd_link "$@" ;;
-  main)         load; cmd_main ;;
-  status)       load; cmd_status ;;
-  harden)       load; cmd_harden ;;
+  list | ls)       load; cmd_list ;;
+  add | new)       load; cmd_add "$@" ;;
+  rm | del)        load; cmd_rm "$@" ;;
+  link | share)    load; cmd_link "$@" ;;
+  main)            load; cmd_main ;;
+  stats)           load; cmd_stats "$@" ;;
+  status)          load; cmd_status ;;
+  restart)         load; cmd_restart ;;
+  migrate | harden) load; cmd_migrate ;;
   help | -h | --help) usage ;;
   *) usage >&2; exit 1 ;;
 esac
@@ -618,6 +881,7 @@ fresh_install() {
   write_params
   secure_files
   install_ctl
+  install_zabbix
   open_firewall
   enable_bbr
   start_xray
@@ -625,14 +889,15 @@ fresh_install() {
   printf '\n%s════════════════════════════════════%s\n' "$GREEN" "$NC"
   printf '%s       Установка завершена!%s\n' "$GREEN" "$NC"
   printf '%s════════════════════════════════════%s\n' "$GREEN" "$NC"
-  printf 'Порт:       %s\nSNI:        %s\nОтпечаток:  %s\nТранспорт:  %s\nPublic key: %s\nShort ID:   %s\n' \
-    "$PORT" "$SNI" "$FINGERPRINT" "$TRANSPORT" "$PUBLIC_KEY" "$SHORT_ID"
+  printf 'Порт:       %s\nAPI:        127.0.0.1:%s (только loopback)\nSNI:        %s\nОтпечаток:  %s\nТранспорт:  %s\nPublic key: %s\nShort ID:   %s\n' \
+    "$PORT" "$API_PORT" "$SNI" "$FINGERPRINT" "$TRANSPORT" "$PUBLIC_KEY" "$SHORT_ID"
   "$CTL" main
-  printf '\nУправление: %sxrayctl list | add <имя> | rm <№|имя> | link <№|имя> | main | status%s\n' "$CYAN" "$NC"
+  printf '\nУправление: %sxrayctl list | add <имя> | rm [-k] <№|имя> | link <№|имя> | main | stats | status%s\n' "$CYAN" "$NC"
   printf 'Бэкапы конфига: %s\n' "$BACKUP_DIR"
 }
 
 upgrade() {
+  local mig=${MIGRATE:-${HARDEN:-}}
   log "Режим обновления: конфиг, ключи и пользователи сохраняются"
   # shellcheck source=/dev/null
   source "$PARAMS"
@@ -640,9 +905,15 @@ upgrade() {
   write_params   # приводим params.env к новому формату (экранирование, SERVER_ADDR)
   secure_files
   install_ctl
-  if [[ ${HARDEN:-} == y ]] \
-    || { [[ -z ${HARDEN:-} ]] && confirm "Применить hardening (закрыть приватные сети и BitTorrent, выключить access-лог)?" y; }; then
-    "$CTL" harden
+  install_zabbix
+  if [[ -z $mig && -t 0 ]]; then
+    confirm "Включить API управления, статистику трафика и hardening? Нужен один перезапуск Xray — сессии переподключатся" y \
+      && mig=y || mig=n
+  fi
+  if [[ $mig == y ]]; then
+    "$CTL" migrate
+  else
+    warn "Миграция конфига пропущена. Без неё add/rm делают рестарт Xray, а статистики нет. Позже: xrayctl migrate"
   fi
   systemctl enable xray >/dev/null 2>&1
   systemctl is-active --quiet xray || systemctl start xray
