@@ -2,11 +2,15 @@
 #
 # install-xray.sh — Xray VLESS + REALITY (TCP/Vision или XHTTP) для Debian/Ubuntu
 #
-# Интерактивно:
-#   sudo ./install-xray.sh
+# Одной командой (вопросы задаются в терминале, в том числе при запуске через пайп):
+#   curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install-xray.sh | sudo bash
+#   wget -qO- https://raw.githubusercontent.com/<owner>/<repo>/main/install-xray.sh | sudo bash
+#
+# Из скачанного файла:
+#   sudo bash install-xray.sh
 #
 # Без вопросов (Ansible / cloud-init / CI):
-#   sudo SNI=www.example.com PORT=443 TRANSPORT=tcp FINGERPRINT=chrome ENABLE_BBR=y ./install-xray.sh
+#   curl -fsSL <URL> | sudo env SNI=www.example.com PORT=443 TRANSPORT=tcp FINGERPRINT=chrome ENABLE_BBR=y bash
 #
 # Необязательные переменные окружения:
 #   XRAY_VERSION=v26.3.27        зафиксировать версию Xray (по умолчанию — последняя)
@@ -16,6 +20,9 @@
 #   MIGRATE=y|n                  при обновлении: включить API/статистику и hardening в существующем конфиге
 #   SKIP_SNI_CHECK=y             не проверять SNI на TLS 1.3 + HTTP/2
 #   SKIP_ZABBIX=y                не ставить UserParameter для Zabbix agent
+#   CHECK_URL=https://...        адрес для сквозной самопроверки (по умолчанию gstatic generate_204)
+#
+# После установки скрипт сам делает самопроверку; повторить вручную: sudo xrayctl check
 #
 # Повторный запуск без FORCE_REINSTALL безопасен: обновит Xray и утилиты, пользователей не тронет.
 #
@@ -54,19 +61,29 @@ trap 'err "Сбой в строке $LINENO: $BASH_COMMAND"' ERR
 
 # ─── Ввод ────────────────────────────────────────────────
 
-# ask VAR "вопрос" [default] — значение из окружения важнее; без TTY берётся default
+# Откуда читать ответы. При запуске `curl ... | bash` stdin — это сам скрипт, поэтому
+# вопросы задаются через терминал (/dev/tty). Терминала нет (cloud-init, CI) — работаем
+# без вопросов: значения берутся из переменных окружения или по умолчанию.
+TTY=''
+if [[ -t 0 ]]; then
+  TTY=/dev/stdin
+elif { : </dev/tty; } 2>/dev/null; then
+  TTY=/dev/tty
+fi
+
+# ask VAR "вопрос" [default] — значение из окружения важнее; без терминала берётся default
 ask() {
   local __var=$1 __prompt=$2 __def=${3:-} __val=''
   if [[ -n ${!__var:-} ]]; then return 0; fi
-  if [[ -t 0 ]]; then read -rp "$__prompt${__def:+ [$__def]}: " __val || true; fi
+  if [[ -n $TTY ]]; then read -rp "$__prompt${__def:+ [$__def]}: " __val <"$TTY" || true; fi
   printf -v "$__var" '%s' "${__val:-$__def}"
 }
 
-# confirm "вопрос" [y|n] — без TTY возвращает default
+# confirm "вопрос" [y|n] — без терминала возвращает default
 confirm() {
   local def=${2:-n} hint='y/N' a=''
   if [[ $def == y ]]; then hint='Y/n'; fi
-  if [[ -t 0 ]]; then read -rp "$1 [$hint]: " a || true; fi
+  if [[ -n $TTY ]]; then read -rp "$1 [$hint]: " a <"$TTY" || true; fi
   [[ ${a:-$def} == [yYдД]* ]]
 }
 
@@ -76,10 +93,10 @@ choose() {
   shift 2
   local -a __opts=("$@")
   if [[ -z ${!__var:-} ]]; then
-    if [[ -t 0 ]]; then
+    if [[ -n $TTY ]]; then
       printf '\n%s:\n' "$__title"
       for __i in "${!__opts[@]}"; do printf '  %d) %s\n' $((__i + 1)) "${__opts[__i]}"; done
-      read -rp "Выбор [1]: " __n || true
+      read -rp "Выбор [1]: " __n <"$TTY" || true
     fi
     __n=${__n:-1}
     [[ $__n =~ ^[1-9][0-9]*$ ]] && ((__n <= ${#__opts[@]})) || err "$__title: неверный выбор '$__n'"
@@ -421,7 +438,12 @@ CHANGED=0
 BACKUP=''
 API=''
 TAG=''
-trap 'if ((${#TMPS[@]})); then rm -f -- "${TMPS[@]}"; fi' EXIT
+CHECK_PID=''
+cleanup() {
+  if [[ -n $CHECK_PID ]]; then kill "$CHECK_PID" 2>/dev/null || true; fi
+  if ((${#TMPS[@]})); then rm -f -- "${TMPS[@]}"; fi
+}
+trap cleanup EXIT
 
 die() { echo "Ошибка: $*" >&2; exit 1; }
 
@@ -441,7 +463,8 @@ usage() {
   main                   ссылка основного пользователя
   stats [--reset]        трафик по пользователям с момента запуска Xray (--reset обнуляет счётчики)
   status                 состояние: unit, порт, API (код возврата 1, если unit или порт не в порядке)
-  restart                перезапустить Xray с проверкой (сбросит все активные сессии)
+  check                  самопроверка: подключиться к серверу ссылкой main, как клиент, и выйти в интернет
+  restart               перезапустить Xray с проверкой (сбросит все активные сессии)
   migrate                включить в существующем конфиге API, статистику и hardening (один рестарт)
 
 Без аргумента add/rm/link спросят интерактивно. Не печатать QR: NOQR=1 xrayctl link 2
@@ -785,6 +808,142 @@ cmd_status() {
   return "$rc"
 }
 
+# ─── Самопроверка ────────────────────────────────────────
+# Поднимает временный клиент Xray с параметрами ссылки основного пользователя, подключается
+# к своему же порту через REALITY и открывает CHECK_URL — тот же путь, что проходит телефон:
+# UUID, ключ, shortId, flow, SNI, транспорт, роутинг и выход сервера в интернет.
+
+chk() {  # chk <ok|fail|warn> <что> <подробности>
+  local mark
+  local pad=$((18 - ${#2}))   # ширина в символах, а не байтах (кириллица)
+  case $1 in ok) mark='[ OK ]' ;; fail) mark='[FAIL]' ;; *) mark='[ !! ]' ;; esac
+  printf '  %s %s%*s %s\n' "$mark" "$2" "$((pad > 0 ? pad : 0))" '' "$3"
+}
+
+free_port() {
+  local p _
+  for _ in $(seq 50); do
+    p=$(shuf -i 20000-60000 -n 1)
+    if ! ss -Htln "sport = :$p" | grep -q .; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+
+cmd_check() {
+  local url=${CHECK_URL:-https://www.gstatic.com/generate_204}
+  local ip_url=${IP_CHECK_URL:-https://api.ipify.org}
+  local rc=0 pub addr_ip v id flow ccfg clog lp code direct errs _
+
+  echo
+  echo "Самопроверка: $SERVER_ADDR:$PORT, $TRANSPORT, SNI $SNI"
+  echo "────────────────────────────────────────────────────────"
+
+  if systemctl is-active --quiet xray; then chk ok "Сервис xray" "запущен"
+  else chk fail "Сервис xray" "не запущен — journalctl -u xray -n 50"; rc=1; fi
+  if port_listening; then chk ok "Порт $PORT" "слушается"
+  else chk fail "Порт $PORT" "не слушается"; rc=1; fi
+
+  # Адрес в ссылках должен совпадать с внешним IP сервера (типичная беда после смены IP)
+  pub=$(curl -4 -fsS --max-time 6 "$ip_url" 2>/dev/null | tr -d '[:space:]') || pub=''
+  if [[ $SERVER_ADDR =~ ^[0-9.]+$ ]]; then addr_ip=$SERVER_ADDR
+  else addr_ip=$(getent ahostsv4 "$SERVER_ADDR" 2>/dev/null | awk 'NR == 1 {print $1}'); fi
+  if [[ -z $pub ]]; then chk warn "Адрес в ссылках" "$SERVER_ADDR (внешний IP узнать не удалось)"
+  elif [[ $pub == "$addr_ip" ]]; then chk ok "Адрес в ссылках" "$SERVER_ADDR = внешний IP сервера"
+  else
+    if [[ $addr_ip == "$SERVER_ADDR" ]]; then addr_ip=''; fi
+    chk fail "Адрес в ссылках" "$SERVER_ADDR${addr_ip:+ ($addr_ip)}, а внешний IP сервера $pub"
+    echo "         Исправить: sed -i 's/^SERVER_ADDR=.*/SERVER_ADDR=$pub/' $PARAMS и выдать ссылки заново"
+    rc=1
+  fi
+
+  # Параметры ссылок (params.env) должны совпадать с конфигом сервера
+  local priv derived bad=()
+  priv=$(q '.inbounds[ib].streamSettings.realitySettings.privateKey // empty')
+  derived=$(xray x25519 -i "$priv" 2>/dev/null \
+    | awk -F': *' 'tolower($1) ~ /public|password/ {print $2; exit}' | tr -d '[:space:]') || derived=''
+  if [[ $derived != "$PUBLIC_KEY" ]]; then bad+=("pbk не от privateKey сервера"); fi
+  if [[ $(q '[.inbounds[ib].streamSettings.realitySettings.shortIds[]?] | any(. == $s)' --arg s "$SHORT_ID") != true ]]; then
+    bad+=("shortId $SHORT_ID нет в конфиге")
+  fi
+  if [[ $(q '[.inbounds[ib].streamSettings.realitySettings.serverNames[]?] | any(. == $s)' --arg s "$SNI") != true ]]; then
+    bad+=("SNI $SNI нет в serverNames")
+  fi
+  if [[ $(q '.inbounds[ib].streamSettings.network // "tcp"') != "$TRANSPORT" ]]; then
+    bad+=("транспорт в конфиге не $TRANSPORT")
+  fi
+  if [[ $(q '.inbounds[ib].port') != "$PORT" ]]; then bad+=("порт в конфиге не $PORT"); fi
+  if ((${#bad[@]} == 0)); then chk ok "Параметры ссылок" "совпадают с конфигом сервера"
+  else
+    chk fail "Параметры ссылок" "$(IFS=';'; echo "${bad[*]}" | sed 's/;/; /g')"
+    echo "         $PARAMS не соответствует $CONFIG — ссылки из xrayctl будут нерабочими"
+    rc=1
+  fi
+
+  # REALITY на каждое подключение ходит на этот сайт — он должен быть доступен с сервера
+  v=$(curl -so /dev/null --max-time 8 --tlsv1.3 --http2 -w '%{http_version}' "https://$SNI" 2>/dev/null) || v=''
+  if [[ $v == 2 ]]; then chk ok "SNI-сайт" "$SNI отвечает по TLS 1.3 + HTTP/2"
+  else chk fail "SNI-сайт" "$SNI недоступен с сервера или без TLS 1.3/HTTP/2 — смени SNI"; rc=1; fi
+
+  # Сквозной тест: клиент из ссылки main → REALITY → сервер → интернет
+  id=$(resolve main)
+  if [[ -z $id ]]; then id=$(resolve 1); fi
+  flow=$(q 'first(clients[] | select(.id == $id) | .flow // "")' --arg id "$id")
+  lp=$(free_port) || { chk fail "Сквозной тест" "нет свободного локального порта"; return 1; }
+  ccfg=$(mktemp --suffix=.json)
+  clog=$(mktemp)
+  TMPS+=("$ccfg" "$clog")
+  jq -n --argjson lp "$lp" --argjson port "$PORT" --arg id "$id" --arg flow "$flow" --arg net "$TRANSPORT" \
+    --arg sni "$SNI" --arg fp "$FINGERPRINT" --arg pbk "$PUBLIC_KEY" --arg sid "$SHORT_ID" '
+    {log: {loglevel: "warning"},
+     inbounds: [{listen: "127.0.0.1", port: $lp, protocol: "socks", settings: {udp: false}}],
+     outbounds: [{protocol: "vless",
+       settings: {vnext: [{address: "127.0.0.1", port: $port,
+         users: [{id: $id, encryption: "none"} + (if $flow == "" then {} else {flow: $flow} end)]}]},
+       streamSettings: ({network: $net, security: "reality",
+         realitySettings: {serverName: $sni, fingerprint: $fp, publicKey: $pbk, shortId: $sid, spiderX: ""}}
+         + (if $net == "xhttp" then {xhttpSettings: {path: "/", mode: "auto"}} else {} end))}]}' > "$ccfg"
+  xray run -config "$ccfg" > "$clog" 2>&1 &
+  CHECK_PID=$!
+  for _ in $(seq 50); do
+    if ss -Htln "sport = :$lp" | grep -q .; then break; fi
+    sleep 0.1
+  done
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 --noproxy '' -x "socks5h://127.0.0.1:$lp" "$url" 2>/dev/null) || true
+  kill "$CHECK_PID" 2>/dev/null || true
+  wait "$CHECK_PID" 2>/dev/null || true
+  CHECK_PID=''
+
+  if [[ ${code:-000} != 000 ]]; then
+    chk ok "Сквозной тест" "ссылка main через REALITY → $url: HTTP $code"
+  else
+    rc=1
+    direct=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null) || true
+    if [[ ${direct:-000} == 000 ]]; then
+      chk fail "Сквозной тест" "у самого сервера нет доступа к $url — проверь DNS и интернет на сервере"
+    else
+      chk fail "Сквозной тест" "через туннель не проходит, хотя напрямую сервер до $url достаёт"
+      errs=$(grep -E '\[(Warning|Error)\]|failed' "$clog" | grep -v 'core: Xray .* started' | tail -n 5) || true
+      if [[ -n $errs ]]; then
+        echo "         Ошибки временного клиента:"
+        sed 's/^/           /' <<<"$errs"
+      fi
+      echo "         Лог сервера: journalctl -u xray -n 30 --no-pager"
+    fi
+  fi
+
+  echo
+  if ((rc == 0)); then
+    echo "  Сервер и ссылки исправны. Если клиент всё равно показывает -1:"
+    echo "   1) удали в клиенте старый профиль и импортируй ссылку заново (xrayctl link <имя>):"
+    echo "      после переустановки ключи новые, старые профили работать не будут;"
+    echo "   2) проверь, доходит ли до порта с твоего устройства. Windows PowerShell:"
+    echo "      Test-NetConnection $SERVER_ADDR -Port $PORT   (TcpTestSucceeded должно быть True)"
+    echo "      False — порт закрыт по пути: фаервол хостера или блокировка провайдера."
+  fi
+  echo
+  return "$rc"
+}
+
 cmd_restart() {
   lock
   BACKUP=''
@@ -859,6 +1018,7 @@ case $cmd in
   main)            load; cmd_main ;;
   stats)           load; cmd_stats "$@" ;;
   status)          load; cmd_status ;;
+  check | test)    load; cmd_check ;;
   restart)         load; cmd_restart ;;
   migrate | harden) load; cmd_migrate ;;
   help | -h | --help) usage ;;
@@ -885,6 +1045,7 @@ fresh_install() {
   open_firewall
   enable_bbr
   start_xray
+  "$CTL" check || warn "Самопроверка нашла проблемы — подробности выше"
 
   printf '\n%s════════════════════════════════════%s\n' "$GREEN" "$NC"
   printf '%s       Установка завершена!%s\n' "$GREEN" "$NC"
@@ -892,7 +1053,9 @@ fresh_install() {
   printf 'Порт:       %s\nAPI:        127.0.0.1:%s (только loopback)\nSNI:        %s\nОтпечаток:  %s\nТранспорт:  %s\nPublic key: %s\nShort ID:   %s\n' \
     "$PORT" "$API_PORT" "$SNI" "$FINGERPRINT" "$TRANSPORT" "$PUBLIC_KEY" "$SHORT_ID"
   "$CTL" main
-  printf '\nУправление: %sxrayctl list | add <имя> | rm [-k] <№|имя> | link <№|имя> | main | stats | status%s\n' "$CYAN" "$NC"
+  printf '\n%sВАЖНО:%s это новая установка с новыми ключами. Старые профили этого сервера в клиентах\n' "$YELLOW" "$NC"
+  printf 'работать не будут — удали их и импортируй ссылку или QR выше.\n'
+  printf '\nУправление: %sxrayctl list | add <имя> | rm [-k] <№|имя> | link <№|имя> | main | stats | status | check%s\n' "$CYAN" "$NC"
   printf 'Бэкапы конфига: %s\n' "$BACKUP_DIR"
 }
 
@@ -906,7 +1069,7 @@ upgrade() {
   secure_files
   install_ctl
   install_zabbix
-  if [[ -z $mig && -t 0 ]]; then
+  if [[ -z $mig && -n $TTY ]]; then
     confirm "Включить API управления, статистику трафика и hardening? Нужен один перезапуск Xray — сессии переподключатся" y \
       && mig=y || mig=n
   fi
@@ -918,7 +1081,8 @@ upgrade() {
   systemctl enable xray >/dev/null 2>&1
   systemctl is-active --quiet xray || systemctl start xray
   health_check
-  "$CTL" status
+  "$CTL" status || true
+  "$CTL" check || warn "Самопроверка нашла проблемы — подробности выше"
   log "Обновление завершено"
 }
 
@@ -928,7 +1092,7 @@ main() {
   if [[ -f $CONFIG && -f $PARAMS ]]; then
     if [[ ${FORCE_REINSTALL:-n} == y ]]; then
       mode=install
-    elif [[ -t 0 ]]; then
+    elif [[ -n $TTY ]]; then
       warn "Xray уже установлен этим скриптом."
       if confirm "Переустановить с нуля? Новые ключи — ВСЕ текущие ссылки перестанут работать" n; then
         mode=install
@@ -950,4 +1114,7 @@ main() {
   fi
 }
 
+# Вызов main — строго последней строкой. При `curl ... | bash` bash выполняет скрипт по мере
+# чтения, поэтому до этой строки ничего не происходит: если скачивание оборвётся на середине,
+# установка просто не начнётся, а команды внутри main уже не смогут «съесть» остаток скрипта.
 main "$@"
