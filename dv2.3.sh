@@ -1,0 +1,1580 @@
+#!/usr/bin/env bash
+#
+# dv2.2 — установщик Xray VLESS + REALITY (TCP/Vision или XHTTP) для Debian/Ubuntu
+#
+# Одной командой (вопросы задаются в терминале, в том числе при запуске через пайп):
+#   curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/dv2.2.sh | sudo bash
+#   wget -qO- https://raw.githubusercontent.com/<owner>/<repo>/main/dv2.2.sh | sudo bash
+#
+# Из скачанного файла:
+#   sudo bash dv2.2.sh
+#
+# Без вопросов (Ansible / cloud-init / CI):
+#   curl -fsSL <URL> | sudo env SNI=www.example.com PORT=443 TRANSPORT=xhttp FINGERPRINT=chrome ENABLE_BBR=y bash
+#
+# Необязательные переменные окружения:
+#   XRAY_VERSION=v26.10.31       зафиксировать версию Xray (по умолчанию — последняя)
+#   SERVER_ADDR=vpn.example.com  адрес в ссылках (по умолчанию — внешний IPv4)
+#   API_PORT=10085               порт gRPC API Xray (слушает только 127.0.0.1)
+#   XHTTP_PATH=/api/v2/sync/ab12 путь XHTTP (по умолчанию генерируется правдоподобный)
+#   XHTTP_MODE=stream-one        режим XHTTP в ссылках: stream-one | stream-up | packet-up | auto
+#   XHTTP_EXTRA=default          пресет XHTTP Extra в ссылках: default | single | rotate | <JSON>
+#   BLOCK_RU=y|n                 не выпускать VPN-трафик на российские домены и IP (по умолчанию y)
+#   FORCE_REINSTALL=y            переустановить поверх существующей установки (ключи и ссылки сменятся)
+#   MIGRATE=y|n                  при обновлении: включить API/статистику и hardening в существующем конфиге
+#   SKIP_SNI_CHECK=y             не проверять SNI на TLS 1.3 + HTTP/2
+#   SKIP_ZABBIX=y                не ставить UserParameter для Zabbix agent
+#   CHECK_URL=https://...        адрес для сквозной самопроверки (по умолчанию gstatic generate_204)
+#
+# После установки скрипт сам делает самопроверку; повторить вручную: sudo xrayctl check
+# Подобрать режим и Extra XHTTP под свою сеть: sudo xrayctl xhttp (подробности там же)
+#
+# Повторный запуск без FORCE_REINSTALL безопасен: обновит Xray и утилиты, пользователей не тронет.
+#
+# Безопасность API: gRPC API Xray не имеет аутентификации и слушает 127.0.0.1. Единственное, что
+# не пускает через него VPN-клиентов, — правило routing «geoip:private → block» в конфиге.
+# Не удаляй его: без него любой клиент сможет дойти до 127.0.0.1:API и добавлять пользователей.
+#
+# Блок RU (BLOCK_RU=y, xrayctl ru): сервер отбрасывает соединения VPN-клиентов к доменам .ru/.su/.рф
+# и прочим зонам РФ, к российским сервисам на других доменах (geosite:category-ru) и к российским
+# IP (geoip:ru). На клиенте такой трафик нужно пускать напрямую (подсказка — в xrayctl ru).
+
+set -Eeuo pipefail
+umask 077
+
+readonly XRAY_DIR=/usr/local/etc/xray
+readonly CONFIG=$XRAY_DIR/config.json
+readonly PARAMS=$XRAY_DIR/params.env
+readonly BACKUP_DIR=$XRAY_DIR/backup
+readonly CTL=/usr/local/bin/xrayctl
+readonly INSTALLER_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+readonly FINGERPRINTS=(chrome firefox safari edge ios android random)
+readonly TRANSPORTS=(tcp xhttp)
+readonly XHTTP_MODES=(stream-one stream-up packet-up auto)
+readonly XHTTP_PRESETS=(default single rotate)
+readonly SCRIPT_VERSION=dv2.2
+# Блок RU — два правила: в Xray условия domain и ip внутри ОДНОГО правила складываются через «И»
+readonly RU_RULES='[
+  {"type": "field", "ruleTag": "block-ru-domain", "outboundTag": "block",
+   "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
+  {"type": "field", "ruleTag": "block-ru-ip", "outboundTag": "block", "ip": ["geoip:ru"]}
+]'
+readonly ZABBIX_DIRS=(/etc/zabbix/zabbix_agentd.d /etc/zabbix/zabbix_agent2.d)
+readonly ZABBIX_UNITS=(zabbix-agent zabbix-agent2)
+
+if [[ -t 1 ]]; then
+  RED=$'\e[0;31m' GREEN=$'\e[0;32m' YELLOW=$'\e[1;33m' CYAN=$'\e[0;36m' NC=$'\e[0m'
+else
+  RED='' GREEN='' YELLOW='' CYAN='' NC=''
+fi
+
+log()  { printf '%s[+]%s %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$YELLOW" "$NC" "$*" >&2; }
+err()  { printf '%s[-]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+TMP_FILES=()
+cleanup() { if ((${#TMP_FILES[@]})); then rm -f -- "${TMP_FILES[@]}"; fi; }
+trap cleanup EXIT
+trap 'err "Сбой в строке $LINENO: $BASH_COMMAND"' ERR
+
+# ─── Ввод ────────────────────────────────────────────────
+
+# Откуда читать ответы. При запуске `curl ... | bash` stdin — это сам скрипт, поэтому
+# вопросы задаются через терминал (/dev/tty). Терминала нет (cloud-init, CI) — работаем
+# без вопросов: значения берутся из переменных окружения или по умолчанию.
+TTY=''
+if [[ -t 0 ]]; then
+  TTY=/dev/stdin
+elif { : </dev/tty; } 2>/dev/null; then
+  TTY=/dev/tty
+fi
+
+# ask VAR "вопрос" [default] — значение из окружения важнее; без терминала берётся default
+ask() {
+  local __var=$1 __prompt=$2 __def=${3:-} __val=''
+  if [[ -n ${!__var:-} ]]; then return 0; fi
+  if [[ -n $TTY ]]; then read -rp "$__prompt${__def:+ [$__def]}: " __val <"$TTY" || true; fi
+  printf -v "$__var" '%s' "${__val:-$__def}"
+}
+
+# confirm "вопрос" [y|n] — без терминала возвращает default
+confirm() {
+  local def=${2:-n} hint='y/N' a=''
+  if [[ $def == y ]]; then hint='Y/n'; fi
+  if [[ -n $TTY ]]; then read -rp "$1 [$hint]: " a <"$TTY" || true; fi
+  [[ ${a:-$def} == [yYдД]* ]]
+}
+
+# choose VAR "заголовок" вариант1 вариант2 ... — первый вариант по умолчанию
+choose() {
+  local __var=$1 __title=$2 __n='' __i __o
+  shift 2
+  local -a __opts=("$@")
+  if [[ -z ${!__var:-} ]]; then
+    if [[ -n $TTY ]]; then
+      printf '\n%s:\n' "$__title"
+      for __i in "${!__opts[@]}"; do printf '  %d) %s\n' $((__i + 1)) "${__opts[__i]}"; done
+      read -rp "Выбор [1]: " __n <"$TTY" || true
+    fi
+    __n=${__n:-1}
+    [[ $__n =~ ^[1-9][0-9]*$ ]] && ((__n <= ${#__opts[@]})) || err "$__title: неверный выбор '$__n'"
+    printf -v "$__var" '%s' "${__opts[__n - 1]}"
+  fi
+  for __o in "${__opts[@]}"; do
+    if [[ $__o == "${!__var}" ]]; then return 0; fi
+  done
+  err "$__title: недопустимое значение '${!__var}' (допустимо: ${__opts[*]})"
+}
+
+# ─── Системное ───────────────────────────────────────────
+
+preflight() {
+  [[ $EUID -eq 0 ]] || err "Запусти от root"
+  command -v apt-get >/dev/null || err "Поддерживаются только Debian/Ubuntu (нужен apt-get)"
+  command -v systemctl >/dev/null || err "Нужен systemd"
+}
+
+# apt_run <аргументы apt-get> — с ожиданием, если apt занят другим процессом (на свежем VPS это
+# автообновления или установка в соседнем окне). install ждёт сам (DPkg::Lock::Timeout),
+# update эту опцию игнорирует — поэтому повторяем, пока блокировка не освободится (до 15 минут).
+apt_run() {
+  local out pid _ said=0
+  for _ in $(seq 180); do
+    if out=$(apt-get -o DPkg::Lock::Timeout=60 "$@" 2>&1 >/dev/null); then return 0; fi
+    if [[ $out != *'Could not get lock'* && $out != *'Unable to acquire'* ]]; then
+      printf '%s\n' "$out" >&2
+      err "apt-get $1 завершился с ошибкой (вывод выше)"
+    fi
+    pid=$(grep -o 'held by process [0-9]*' <<<"$out" | grep -o '[0-9]*$' | head -n 1) || true
+    if ((said == 0)); then
+      warn "apt занят другим процессом${pid:+: $(ps -o etime=,cmd= -p "$pid" 2>/dev/null | sed 's/^ *//')}. Жду, пока освободится..."
+    elif ((said == 24)); then
+      warn "apt занят уже больше 2 минут. Если это установка в другом окне — проверь, не ждёт ли она"
+      warn "ответа (на Ubuntu часто висит окно needrestart: нажми там Enter). Процессы apt не убивай через kill -9."
+    fi
+    said=$((said + 1))
+    sleep 5
+  done
+  err "apt занят больше 15 минут. Посмотри: ps -ef --forest | grep -B2 -A4 [a]pt — и запусти скрипт снова"
+}
+
+install_deps() {
+  log "Устанавливаю зависимости..."
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+  apt_run update -qq
+  apt_run install -y -qq --no-install-recommends \
+    curl ca-certificates jq qrencode openssl iproute2 unzip util-linux
+}
+
+install_xray() {
+  local installer
+  local -a args=(install)
+  installer=$(mktemp)
+  TMP_FILES+=("$installer")
+  log "Скачиваю официальный установщик Xray..."
+  curl -fsSL --retry 3 --max-time 60 -o "$installer" "$INSTALLER_URL" \
+    || err "Не удалось скачать $INSTALLER_URL"
+  if [[ -n ${XRAY_VERSION:-} ]]; then args+=(--version "$XRAY_VERSION"); fi
+  log "Устанавливаю Xray ${XRAY_VERSION:-(последняя версия)}..."
+  bash "$installer" "${args[@]}" || err "Официальный установщик Xray завершился с ошибкой"
+  command -v xray >/dev/null || err "Бинарник xray не найден после установки"
+  log "$(xray version | sed -n 1p)"
+}
+
+# Группа пользователя, от которого systemd запускает xray (по умолчанию nobody → nogroup)
+xray_group() {
+  local user
+  user=$(systemctl show -p User --value xray 2>/dev/null || true)
+  id -gn "${user:-root}"
+}
+
+# Конфиг содержит приватный ключ и UUID всех пользователей — не должен быть world-readable
+secure_files() {
+  chown "root:$(xray_group)" "$CONFIG"
+  chmod 640 "$CONFIG"
+  chown root:root "$PARAMS"
+  chmod 600 "$PARAMS"
+}
+
+backup_config() {
+  [[ -s $CONFIG ]] || return 0
+  local dst
+  install -d -m 700 "$BACKUP_DIR"
+  dst="$BACKUP_DIR/config.pre-reinstall.$(date +%Y%m%d-%H%M%S).json"
+  cp -p "$CONFIG" "$dst"
+  log "Предыдущий конфиг сохранён: $dst"
+}
+
+health_check() {
+  local _
+  sleep 2
+  for _ in 1 2 3 4 5; do
+    if systemctl is-active --quiet xray && [[ -n $(ss -Htln "sport = :$PORT") ]]; then return 0; fi
+    sleep 1
+  done
+  journalctl -u xray -n 30 --no-pager >&2 || true
+  err "Xray не запустился или не слушает порт $PORT (лог выше)"
+}
+
+api_check() {
+  local out
+  out=$(xray api inboundusercount -s "127.0.0.1:$API_PORT" -t 5 -tag=vless-in 2>&1) \
+    || err "API Xray не отвечает на 127.0.0.1:$API_PORT:"$'\n'"$out"
+  log "API Xray отвечает (127.0.0.1:$API_PORT), статистика по пользователям включена"
+}
+
+start_xray() {
+  log "Запускаю Xray..."
+  systemctl enable xray >/dev/null 2>&1
+  systemctl restart xray
+  health_check
+  log "Xray работает и слушает порт $PORT"
+  api_check
+}
+
+open_firewall() {
+  if command -v ufw >/dev/null && [[ $(ufw status 2>/dev/null) == "Status: active"* ]]; then
+    ufw allow "$PORT/tcp" comment 'xray' >/dev/null || warn "Не удалось открыть порт в UFW"
+    log "UFW: открыт $PORT/tcp"
+  else
+    warn "UFW не активен. Если используешь фаервол хостера или nftables — открой $PORT/tcp там."
+  fi
+}
+
+enable_bbr() {
+  ask ENABLE_BBR "Включить TCP BBR (y/n)" y
+  [[ $ENABLE_BBR == [yY]* ]] || return 0
+  if [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == bbr ]]; then
+    log "BBR уже включён"
+    return 0
+  fi
+  modprobe tcp_bbr 2>/dev/null || true
+  if [[ $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) != *bbr* ]]; then
+    warn "Ядро не поддерживает BBR — пропускаю"
+    return 0
+  fi
+  printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > /etc/sysctl.d/99-xray-bbr.conf
+  sysctl -q -p /etc/sysctl.d/99-xray-bbr.conf
+  log "BBR включён"
+}
+
+# ─── Мониторинг (Zabbix agent) ───────────────────────────
+
+# Две проверки: unit активен и порт слушается. Порт зашивается в файл при установке/обновлении.
+# Абсолютные пути: у агента укороченный PATH. Все права — обычного пользователя zabbix.
+install_zabbix() {
+  local d u ss_bin sc_bin conf found=0
+  [[ ${SKIP_ZABBIX:-n} != y ]] || return 0
+  ss_bin=$(command -v ss) sc_bin=$(command -v systemctl)
+  conf=$(printf '%s\n' \
+    "# Управляется установщиком $SCRIPT_VERSION (порт Xray: $PORT). Перезаписывается при обновлении." \
+    "UserParameter=xray.unit.active,$sc_bin is-active --quiet xray && echo 1 || echo 0" \
+    "UserParameter=xray.port.listen,$ss_bin -Htln 'sport = :$PORT' | grep -q . && echo 1 || echo 0")
+  for d in "${ZABBIX_DIRS[@]}"; do
+    [[ -d $d ]] || continue
+    printf '%s\n' "$conf" > "$d/userparameter_xray.conf"
+    chown root:root "$d/userparameter_xray.conf"
+    chmod 644 "$d/userparameter_xray.conf"
+    found=1
+  done
+  if ((!found)); then
+    warn "Zabbix agent не найден — пропускаю. Для ручной настройки добавь в конфиг агента:"
+    printf '%s\n' "$conf" | sed 1d >&2
+    return 0
+  fi
+  for u in "${ZABBIX_UNITS[@]}"; do
+    if systemctl is-active --quiet "$u"; then
+      systemctl restart "$u" && log "Перезапущен $u (подхватил ключи xray.*)"
+    fi
+  done
+  log "Zabbix: ключи xray.unit.active и xray.port.listen (шаблон: zabbix_template_xray.yaml)"
+}
+
+# ─── Параметры и ключи ───────────────────────────────────
+
+detect_ip() {
+  local src ip
+  for src in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip=$(curl -4 -fsS --max-time 5 "$src" 2>/dev/null | tr -d '[:space:]') || continue
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# REALITY требует от маскировочного сайта TLS 1.3 и HTTP/2
+check_sni() {
+  local v
+  v=$(curl -so /dev/null --max-time 8 --tlsv1.3 --http2 -w '%{http_version}' "https://$1") || return 1
+  [[ $v == 2 ]]
+}
+
+# check_port_free <порт> <название>: порт свободен или занят самим xray (переустановка)
+check_port_free() {
+  local holder
+  [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (($1 <= 65535)) || err "Некорректный порт ($2): $1"
+  holder=$(ss -Htlnp "sport = :$1")
+  if [[ -n $holder && $holder != *'"xray"'* ]]; then
+    err "Порт $1 ($2) уже занят: $(awk '{print $NF}' <<<"$holder" | sort -u | paste -sd' ')"
+  fi
+}
+
+# Правдоподобный путь XHTTP — как у API обычного веб-приложения, например /api/v2/events/3fa9c1d27b.
+# Xray допишет к нему /<id сессии>/<номер пакета> (stream-up, packet-up), что тоже выглядит как REST.
+gen_xhttp_path() {
+  local -a pre=(api api/v1 api/v2 api/v3 v1 v2 rest/v1 internal/api app/api)
+  local -a word=(events sync telemetry collect messages updates stream realtime metrics analytics feed notifications)
+  local p=${pre[RANDOM % ${#pre[@]}]} w=${word[RANDOM % ${#word[@]}]} id
+  id=$(openssl rand -hex 5)
+  case $((RANDOM % 3)) in
+    0) printf '/%s/%s/%s\n' "$p" "$w" "$id" ;;
+    1) printf '/%s/%s/%s\n' "$p" "$id" "$w" ;;
+    *) printf '/%s/%s-%s\n' "$p" "$w" "$id" ;;
+  esac
+}
+
+check_xhttp_path() {
+  [[ $1 =~ ^/[A-Za-z0-9._~/-]{0,120}$ && $1 != *//* ]] \
+    || err "Некорректный XHTTP_PATH '$1': начинается с /, только латиница, цифры и . _ ~ - /, без ? и //"
+}
+
+# Пресет или JSON для XHTTP Extra; сами пресеты описаны в xrayctl (xrayctl xhttp)
+check_xhttp_extra() {
+  local p
+  for p in "${XHTTP_PRESETS[@]}"; do
+    if [[ $1 == "$p" ]]; then return 0; fi
+  done
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$1" \
+    || err "XHTTP_EXTRA: ожидается пресет (${XHTTP_PRESETS[*]}) или JSON-объект, получено '$1'"
+}
+
+collect_params() {
+  local detected=''
+
+  ask PORT "Порт" 443
+  check_port_free "$PORT" "Xray"
+  API_PORT=${API_PORT:-10085}
+  check_port_free "$API_PORT" "API"
+  [[ $API_PORT != "$PORT" ]] || err "API_PORT не может совпадать с PORT"
+
+  ask SNI "SNI (чужой домен с TLS 1.3 + HTTP/2, не google.com)" ""
+  [[ -n $SNI ]] || err "SNI обязателен (для запуска без вопросов задай SNI=домен)"
+  SNI=${SNI,,}
+  [[ $SNI =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || err "Некорректный домен: $SNI"
+  if [[ ${SKIP_SNI_CHECK:-n} != y ]]; then
+    log "Проверяю $SNI: TLS 1.3 + HTTP/2..."
+    if ! check_sni "$SNI"; then
+      warn "$SNI недоступен с сервера или не отдаёт TLS 1.3 + HTTP/2 — REALITY с ним работать не будет"
+      confirm "Всё равно продолжить?" n || err "Прервано. Выбери другой SNI."
+    fi
+  fi
+
+  choose FINGERPRINT "TLS-отпечаток клиента (fp)" "${FINGERPRINTS[@]}"
+  choose TRANSPORT "Транспорт" "${TRANSPORTS[@]}"
+  if [[ $TRANSPORT == xhttp ]]; then
+    XHTTP_PATH=${XHTTP_PATH:-$(gen_xhttp_path)}
+    check_xhttp_path "$XHTTP_PATH"
+    # Сервер всегда принимает все режимы (mode: auto); здесь выбирается режим для ссылок клиентов
+    choose XHTTP_MODE "Режим XHTTP в ссылках (stream-one — оптимум для REALITY без CDN, сервер принимает все)" \
+      "${XHTTP_MODES[@]}"
+    XHTTP_EXTRA=${XHTTP_EXTRA:-default}
+    check_xhttp_extra "$XHTTP_EXTRA"
+  fi
+
+  ask BLOCK_RU "Не выпускать VPN-трафик на российские сайты и IP (.ru/.su/.рф, RU-сервисы, geoip:ru)? (y/n)" y
+  if [[ $BLOCK_RU == [yYдД]* ]]; then BLOCK_RU=y; else BLOCK_RU=n; fi
+
+  if [[ -z ${SERVER_ADDR:-} ]]; then
+    detected=$(detect_ip) || warn "Не удалось определить внешний IPv4"
+    ask SERVER_ADDR "Адрес сервера в ссылках (IP или домен)" "$detected"
+  fi
+  [[ $SERVER_ADDR =~ ^[A-Za-z0-9.:-]+$ ]] || err "Некорректный адрес сервера: '$SERVER_ADDR'"
+}
+
+gen_keys() {
+  local out
+  log "Генерирую ключи..."
+  out=$(xray x25519)
+  # Формат вывода менялся между версиями Xray ("Private key:" → "PrivateKey:",
+  # "Public key:" → "Password (PublicKey):"), поэтому ищем по меткам, а не по номеру строки
+  PRIVATE_KEY=$(awk -F': *' 'tolower($1) ~ /private/        {print $2; exit}' <<<"$out" | tr -d '[:space:]')
+  PUBLIC_KEY=$(awk -F': *'  'tolower($1) ~ /public|password/ {print $2; exit}' <<<"$out" | tr -d '[:space:]')
+  [[ $PRIVATE_KEY =~ ^[A-Za-z0-9_-]{43}$ && $PUBLIC_KEY =~ ^[A-Za-z0-9_-]{43}$ ]] \
+    || err "Не удалось разобрать вывод 'xray x25519':"$'\n'"$out"
+  UUID=$(xray uuid)
+  SHORT_ID=$(openssl rand -hex 8)
+}
+
+# ─── Конфиг ──────────────────────────────────────────────
+
+write_config() {
+  local tmp out
+  log "Записываю конфиг..."
+  # суффикс .json обязателен: по расширению xray определяет формат файла
+  tmp=$(mktemp --suffix=.json -p "$XRAY_DIR" .config.XXXXXX)
+  TMP_FILES+=("$tmp")
+  jq -n \
+    --argjson port "$PORT" --argjson api "$API_PORT" --arg sni "$SNI" --arg net "$TRANSPORT" \
+    --arg pk "$PRIVATE_KEY" --arg sid "$SHORT_ID" --arg uuid "$UUID" --arg xpath "${XHTTP_PATH:-/}" \
+    --argjson ru "$(if [[ ${BLOCK_RU:-y} == y ]]; then printf '%s' "$RU_RULES"; else echo '[]'; fi)" '
+    ($net == "tcp") as $tcp
+    | {
+        log: {loglevel: "warning", access: "none"},
+        # gRPC API напрямую на loopback (без dokodemo-inbound и routing-правила) + статистика
+        stats: {},
+        api: {tag: "api", listen: "127.0.0.1:\($api)", services: ["HandlerService", "StatsService"]},
+        policy: {
+          levels: {"0": {statsUserUplink: true, statsUserDownlink: true}},
+          system: {statsInboundUplink: true, statsInboundDownlink: true}
+        },
+        inbounds: [{
+          tag: "vless-in",
+          listen: "0.0.0.0",
+          port: $port,
+          protocol: "vless",
+          settings: {
+            clients: [{id: $uuid, email: "main"} + (if $tcp then {flow: "xtls-rprx-vision"} else {} end)],
+            decryption: "none"
+          },
+          streamSettings: ({
+            network: $net,
+            security: "reality",
+            realitySettings: {
+              show: false,
+              dest: "\($sni):443",
+              serverNames: [$sni],
+              privateKey: $pk,
+              shortIds: [$sid]
+            }
+          } + (if $tcp then {} else {xhttpSettings: {path: $xpath, mode: "auto"}} end)),
+          sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+        }],
+        outbounds: [
+          {protocol: "freedom", tag: "direct"},
+          {protocol: "blackhole", tag: "block"}
+        ],
+        routing: {
+          domainStrategy: "IPIfNonMatch",
+          rules: ([{type: "field", ip: ["geoip:private"], outboundTag: "block"}]
+            + $ru
+            + [{type: "field", protocol: ["bittorrent"], outboundTag: "block"}])
+        }
+      }' > "$tmp"
+  out=$(xray run -test -config "$tmp" 2>&1) || err "Сгенерированный конфиг невалиден:"$'\n'"$out"
+  chmod 640 "$tmp"
+  chown "root:$(xray_group)" "$tmp"
+  mv -f "$tmp" "$CONFIG"
+}
+
+# Значения экранируются через %q, поэтому последующий `source` безопасен
+write_params() {
+  local tmp k
+  tmp=$(mktemp -p "$XRAY_DIR")
+  TMP_FILES+=("$tmp")
+  {
+    echo "# Сгенерировано $SCRIPT_VERSION $(date -Is). Читается xrayctl."
+    local -a keys=(SERVER_ADDR PORT SNI TRANSPORT FINGERPRINT PUBLIC_KEY SHORT_ID)
+    if [[ $TRANSPORT == xhttp ]]; then keys+=(XHTTP_PATH XHTTP_MODE XHTTP_EXTRA); fi
+    for k in "${keys[@]}"; do
+      [[ -n ${!k:-} ]] || err "Параметр $k пуст"
+      printf '%s=%q\n' "$k" "${!k}"
+    done
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$PARAMS"
+}
+
+# ─── Утилита управления ──────────────────────────────────
+
+install_ctl() {
+  local tmp n
+  log "Устанавливаю xrayctl..."
+  tmp=$(mktemp)
+  TMP_FILES+=("$tmp")
+  cat > "$tmp" <<'XRAYCTL'
+#!/usr/bin/env bash
+# xrayctl — управление пользователями VLESS + REALITY (ставится установщиком dv2.2)
+#
+# Пользователи добавляются и удаляются «на лету» через gRPC API Xray (xray api adu/rmu),
+# без перезапуска и без обрыва чужих сессий. Конфиг на диске обновляется в любом случае,
+# поэтому после рестарта/ребута всё на месте. Если API недоступен — откат на обычный рестарт.
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C.UTF-8   # длина строк считается в символах, а не в байтах (выравнивание кириллицы)
+
+readonly XRAY_DIR=/usr/local/etc/xray
+readonly CONFIG=$XRAY_DIR/config.json
+readonly PARAMS=$XRAY_DIR/params.env
+readonly BACKUP_DIR=$XRAY_DIR/backup
+readonly KEEP_BACKUPS=20
+readonly LOCK_FILE=/run/xrayctl.lock
+readonly SCRIPT_VERSION=dv2.2
+# Блок RU — два правила: в Xray условия domain и ip внутри ОДНОГО правила складываются через «И»
+readonly RU_RULES='[
+  {"type": "field", "ruleTag": "block-ru-domain", "outboundTag": "block",
+   "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
+  {"type": "field", "ruleTag": "block-ru-ip", "outboundTag": "block", "ip": ["geoip:ru"]}
+]'
+
+# Первый VLESS-инбаунд; работает и с конфигами старых версий скрипта
+readonly JQ_DEFS='
+  def ib: .inbounds | map(.protocol) | index("vless");
+  def clients: .inbounds[ib].settings.clients;
+'
+
+TMPS=()
+LOCKED=''
+CHANGED=0
+BACKUP=''
+API=''
+TAG=''
+CHECK_PID=''
+cleanup() {
+  if [[ -n $CHECK_PID ]]; then kill "$CHECK_PID" 2>/dev/null || true; fi
+  if ((${#TMPS[@]})); then rm -f -- "${TMPS[@]}"; fi
+}
+trap cleanup EXIT
+
+die() { echo "Ошибка: $*" >&2; exit 1; }
+
+kv() {  # kv <ключ> <значение> — строка «ключ: значение» с выравниванием по символам
+  local pad=$((18 - ${#1}))
+  printf '%s%*s %s\n' "$1" "$((pad > 0 ? pad : 0))" '' "$2"
+}
+
+usage() {
+  cat <<EOF
+Использование: xrayctl <команда> [аргументы]
+
+  list                   список пользователей
+  add [имя]              добавить пользователя (без перезапуска Xray), показать ссылку и QR
+  rm [-k] [№|имя|uuid]   удалить пользователя; -k — ещё и оборвать его активные сессии (рестарт)
+  link [№|имя|uuid]      ссылка и QR для пользователя
+  main                   ссылка основного пользователя
+  stats [--reset]        трафик по пользователям с момента запуска Xray (--reset обнуляет счётчики)
+  status                 состояние: unit, порт, API (код возврата 1, если unit или порт не в порядке)
+  check                  самопроверка: подключиться к серверу ссылкой main, как клиент, и выйти в интернет
+  xhttp                  режим и Extra XHTTP для ссылок, тестовые ссылки, смена пути (xrayctl xhttp help)
+  ru [status|on|off]     не выпускать VPN-трафик на российские домены и IP (рестарт при on/off)
+  version                версия установщика и Xray
+  restart               перезапустить Xray с проверкой (сбросит все активные сессии)
+  migrate                включить в существующем конфиге API, статистику и hardening (один рестарт)
+
+Без аргумента add/rm/link спросят интерактивно. Не печатать QR: NOQR=1 xrayctl link 2
+Старые команды userlist/newuser/rmuser/sharelink/mainuser работают как алиасы; harden = migrate.
+EOF
+}
+
+load() {
+  [[ $EUID -eq 0 ]] || die "запусти от root (sudo xrayctl ...)"
+  [[ -f $CONFIG ]] || die "не найден $CONFIG — Xray не установлен"
+  [[ -f $PARAMS ]] || die "не найден $PARAMS"
+  # shellcheck source=/dev/null
+  source "$PARAMS"
+  SERVER_ADDR=${SERVER_ADDR:-${SERVER_IP:-}}   # совместимость со старым params.env
+  local v
+  for v in SERVER_ADDR PORT SNI TRANSPORT FINGERPRINT PUBLIC_KEY SHORT_ID; do
+    [[ -n ${!v:-} ]] || die "в $PARAMS не задан $v"
+  done
+  jq -e "$JQ_DEFS ib != null" "$CONFIG" >/dev/null || die "в $CONFIG нет VLESS-инбаунда"
+  if [[ $TRANSPORT == xhttp ]]; then
+    XHTTP_PATH=${XHTTP_PATH:-$(q '.inbounds[ib].streamSettings.xhttpSettings.path // "/"')}
+    XHTTP_MODE=${XHTTP_MODE:-stream-one}
+    XHTTP_EXTRA=${XHTTP_EXTRA:-default}
+  fi
+  load_api
+}
+
+# set_param <ключ> <значение> — атомарно обновить params.env (значение экранируется через %q)
+set_param() {
+  local tmp
+  tmp=$(mktemp -p "$XRAY_DIR")
+  TMPS+=("$tmp")
+  grep -v "^$1=" "$PARAMS" > "$tmp" || true
+  printf '%s=%q\n' "$1" "$2" >> "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$PARAMS"
+}
+
+# ─── XHTTP: режимы и пресеты Extra ───────────────────────
+# Всё ниже — настройки КЛИЕНТА: уходят в ссылку (mode=, extra=). Сервер слушает с mode: auto
+# и принимает любой режим, поэтому смена режима или пресета не требует ни рестарта, ни правки конфига.
+readonly XHTTP_MODES=(stream-one stream-up packet-up auto)
+readonly XHTTP_PRESETS=(default single rotate)
+
+# extra_json <пресет|JSON> → компактный JSON для xhttpSettings.extra (пусто для default)
+extra_json() {
+  case $1 in
+    default) ;;
+    # Одно HTTP/2-соединение на всё, переоткрывается раз в 30–50 минут: меньше рукопожатий,
+    # похоже на одну открытую вкладку браузера
+    single) printf '%s\n' '{"xmux":{"maxConnections":1,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000"}}' ;;
+    # Частая смена соединений (каждые 1–2 минуты или 64–128 запросов): для сетей, где режут или
+    # «замораживают» долгоживущие соединения к зарубежным серверам
+    rotate) printf '%s\n' '{"xmux":{"maxConnections":"2-4","cMaxReuseTimes":"16-32","hMaxRequestTimes":"64-128","hMaxReusableSecs":"60-120"}}' ;;
+    *) jq -ce 'if type == "object" then . else error("не объект") end' <<<"$1" 2>/dev/null \
+         || die "Extra: ожидается пресет (${XHTTP_PRESETS[*]}) или JSON-объект" ;;
+  esac
+}
+
+is_xhttp_mode() {
+  local m
+  for m in "${XHTTP_MODES[@]}"; do
+    if [[ $1 == "$m" ]]; then return 0; fi
+  done
+  return 1
+}
+
+extra_label() {  # короткое имя для подписи: имя пресета или «custom»
+  local p
+  for p in "${XHTTP_PRESETS[@]}"; do
+    if [[ $1 == "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+  done
+  printf 'custom\n'
+}
+
+# Адрес API и тег инбаунда берутся из самого конфига — единственный источник правды
+load_api() {
+  API=$(q '.api.listen // empty')
+  TAG=$(q '.inbounds[ib].tag // empty')
+}
+
+# q <jq-фильтр> [аргументы jq] — запрос к конфигу
+q() {
+  local filter=$1
+  shift
+  jq -r "$@" "$JQ_DEFS $filter" "$CONFIG"
+}
+
+lock() {
+  if [[ -n $LOCKED ]]; then return 0; fi
+  exec 9>"$LOCK_FILE"
+  flock -w 30 9 || die "конфиг сейчас меняет другой процесс"
+  LOCKED=1
+}
+
+confirm() {
+  local a=''
+  read -rp "$1 [y/N]: " a || true
+  [[ $a == [yYдД]* ]]
+}
+
+# resolve <№|имя|uuid> → UUID (пусто, если не найден)
+resolve() {
+  q '[clients[]] as $c
+     | if ($k | test("^[0-9]+$"))
+       then ($k | tonumber) as $n | select($n >= 1 and $n <= ($c | length)) | $c[$n - 1].id
+       else first($c[] | select(.id == $k or .email == $k) | .id)
+       end' --arg k "$1"
+}
+
+email_of() {
+  q 'first(clients[] | select(.id == $id) | .email // $def)' --arg id "$1" --arg def "${2-User}"
+}
+
+# pick "<аргумент>" "<подсказка>" → UUID; без аргумента спрашивает интерактивно
+pick() {
+  local key=$1 id
+  if [[ -z $key ]]; then
+    [[ -t 0 ]] || die "не указан пользователь"
+    cmd_list >&2
+    read -rp "$2: " key
+  fi
+  id=$(resolve "$key")
+  [[ -n $id ]] || die "пользователь '$key' не найден"
+  printf '%s\n' "$id"
+}
+
+urlencode() { jq -rn --arg s "$1" '$s | @uri'; }
+
+make_link() {  # make_link <uuid> <метка> [режим XHTTP] [пресет|JSON Extra]
+  local host=$SERVER_ADDR query mode=${3:-${XHTTP_MODE:-}} extra
+  if [[ $host == *:* ]]; then host="[$host]"; fi   # IPv6
+  query="encryption=none&security=reality&sni=$SNI&fp=$FINGERPRINT&pbk=$PUBLIC_KEY&sid=$SHORT_ID"
+  if [[ $TRANSPORT == tcp ]]; then
+    query+="&flow=xtls-rprx-vision&type=tcp"
+  else
+    query+="&type=xhttp&path=$(urlencode "$XHTTP_PATH")&mode=$mode"
+    extra=$(extra_json "${4:-$XHTTP_EXTRA}")
+    if [[ -n $extra ]]; then query+="&extra=$(urlencode "$extra")"; fi
+  fi
+  printf 'vless://%s@%s:%s?%s#%s\n' "$1" "$host" "$PORT" "$query" "$(urlencode "$2")"
+}
+
+show_link() {  # show_link <uuid> <метка> <заголовок>
+  local link
+  link=$(make_link "$1" "$2")
+  printf '\n════════════════════════════════════\n  %s\n════════════════════════════════════\n' "$3"
+  printf 'Имя:  %s\nUUID: %s\n\nVLESS-ссылка:\n%s\n\n' "$2" "$1" "$link"
+  if [[ ${NOQR:-0} != 1 ]]; then qrencode -t ANSIUTF8 "$link"; fi
+}
+
+# ─── Состояние сервиса ───────────────────────────────────
+
+port_listening() { [[ -n $(ss -Htln "sport = :$PORT") ]]; }
+
+healthy() {
+  local _
+  sleep 2
+  for _ in 1 2 3 4 5; do
+    if systemctl is-active --quiet xray && port_listening; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+api_up() {
+  [[ -n $API && -n $TAG ]] || return 1
+  xray api inboundusercount -s "$API" -t 3 -tag="$TAG" >/dev/null 2>&1
+}
+
+api_count() {
+  xray api inboundusercount -s "$API" -t 3 -tag="$TAG" 2>/dev/null | jq -r '.count // 0'
+}
+
+# ─── Изменение конфига ───────────────────────────────────
+
+# apply_config <jq-фильтр> [аргументы jq] — только конфиг на диске, без рестарта:
+# новый конфиг во временный файл → xray -test → бэкап → атомарная замена.
+# CHANGED=1, если что-то изменилось; BACKUP — путь к копии прежнего конфига.
+apply_config() {
+  local filter=$1 newcfg out
+  shift
+  lock
+  CHANGED=0
+  newcfg=$(mktemp --suffix=.json -p "$XRAY_DIR" .config.XXXXXX)
+  TMPS+=("$newcfg")
+  jq "$@" "$JQ_DEFS $filter" "$CONFIG" > "$newcfg"
+  if jq -e --slurpfile old "$CONFIG" '. == $old[0]' "$newcfg" >/dev/null; then return 0; fi
+  out=$(xray run -test -config "$newcfg" 2>&1) \
+    || die "новый конфиг не прошёл проверку, ничего не изменено:"$'\n'"$out"
+  chown --reference="$CONFIG" "$newcfg"
+  chmod --reference="$CONFIG" "$newcfg"
+  install -d -m 700 "$BACKUP_DIR"
+  BACKUP="$BACKUP_DIR/config.$(date +%Y%m%d-%H%M%S).$$.json"
+  cp -p "$CONFIG" "$BACKUP"
+  mv -f "$newcfg" "$CONFIG"
+  CHANGED=1
+  find "$BACKUP_DIR" -maxdepth 1 -name 'config.*.json' ! -name 'config.pre-reinstall.*' -printf '%T@ %p\n' \
+    | sort -rn | tail -n +$((KEEP_BACKUPS + 1)) | cut -d' ' -f2- | xargs -r rm -f --
+}
+
+# Рестарт с проверкой; если Xray не поднялся — возвращаем прежний конфиг и падаем
+restart_or_rollback() {
+  systemctl restart xray || true
+  if healthy; then return 0; fi
+  journalctl -u xray -n 20 --no-pager >&2 || true
+  if [[ -n $BACKUP ]]; then
+    cp -p "$BACKUP" "$CONFIG"
+    systemctl restart xray || true
+    die "Xray не поднялся с новым конфигом — восстановлен $BACKUP"
+  fi
+  die "Xray не поднялся"
+}
+
+# ─── Горячее обновление пользователей через API ──────────
+# ВАЖНО: `xray api adu/rmu` возвращают код 0 даже при провале («Added 0 user(s)»),
+# поэтому результат всегда проверяется отдельным запросом inbounduser.
+
+runtime_user() {  # runtime_user <email> → JSON ответа inbounduser
+  xray api inbounduser -s "$API" -t 5 -tag="$TAG" -email="$1" 2>/dev/null
+}
+
+runtime_add() {  # runtime_add <uuid> <email> <flow|''>
+  local f
+  [[ -n $API && -n $TAG ]] || return 1
+  f=$(mktemp)
+  TMPS+=("$f")
+  # port нужен только парсеру xray (адреса/порты adu не использует)
+  jq -n --arg tag "$TAG" --argjson port "$PORT" --arg id "$1" --arg email "$2" --arg flow "$3" '
+    {inbounds: [{tag: $tag, port: $port, protocol: "vless",
+      settings: {clients: [{id: $id, email: $email} + (if $flow == "" then {} else {flow: $flow} end)],
+                 decryption: "none"}}]}' > "$f"
+  xray api adu -s "$API" -t 5 "$f" >/dev/null 2>&1 || true
+  runtime_user "$2" | jq -e --arg id "$1" '.users[0].account.id == $id' >/dev/null
+}
+
+runtime_rm() {  # runtime_rm <email>
+  local out
+  [[ -n $API && -n $TAG && -n ${1:-} ]] || return 1
+  xray api rmu -s "$API" -t 5 -tag="$TAG" "$1" >/dev/null 2>&1 || true
+  out=$(runtime_user "$1") || return 1
+  jq -e '(.users[0].email // "") == ""' <<<"$out" >/dev/null
+}
+
+# ─── Команды ─────────────────────────────────────────────
+
+cmd_list() {
+  local n id email
+  echo
+  printf '  %-3s  %-36s  %s\n' '#' 'UUID' 'Имя'
+  while IFS=$'\t' read -r n id email; do
+    printf '  %-3s  %-36s  %s\n' "$n" "$id" "$email"
+  done < <(q 'clients | to_entries[] | [(.key + 1 | tostring), .value.id, (.value.email // "-")] | @tsv')
+  printf '\n  Всего: %s\n\n' "$(q 'clients | length')"
+}
+
+cmd_add() {
+  local name=${1:-} id flow='' how
+  # 1–32 символа; без пробелов, кавычек, '\', '>' (разделитель имён статистики) и '-' в начале
+  local re='^[^[:space:][:cntrl:]"\\>-][^[:space:][:cntrl:]"\\>]{0,31}$'
+  if [[ -z $name ]]; then
+    [[ -t 0 ]] || die "укажи имя: xrayctl add <имя>"
+    read -rp "Имя пользователя (без пробелов): " name
+  fi
+  [[ $name =~ $re ]] || die "имя: 1–32 символа, без пробелов, кавычек, '\\', '>' и без '-' в начале"
+  [[ ! $name =~ ^[0-9]+$ ]] || die "имя не может состоять только из цифр (путается с номером)"
+  lock
+  [[ -z $(resolve "$name") ]] || die "пользователь '$name' уже существует"
+  id=$(xray uuid)
+  if [[ $TRANSPORT == tcp ]]; then flow=xtls-rprx-vision; fi
+  apply_config 'clients += [{id: $id, email: $email} + (if $flow == "" then {} else {flow: $flow} end)]' \
+    --arg id "$id" --arg email "$name" --arg flow "$flow"
+  if runtime_add "$id" "$name" "$flow"; then
+    how="добавлен без перезапуска Xray"
+  else
+    echo "API не принял пользователя — перезапускаю Xray" >&2
+    restart_or_rollback
+    how="добавлен, Xray перезапущен"
+  fi
+  show_link "$id" "$name" "Пользователь $how"
+}
+
+cmd_rm() {
+  local key='' kick=0 a id name
+  for a in "$@"; do
+    case $a in
+      -k | --kick) kick=1 ;;
+      *) key=$a ;;
+    esac
+  done
+  lock
+  id=$(pick "$key" "Номер, имя или UUID для удаления")
+  name=$(email_of "$id" "")
+  (($(q 'clients | length') > 1)) || die "нельзя удалить последнего пользователя"
+  if [[ -z $key ]] && ! confirm "Удалить '${name:-$id}' ($id)?"; then
+    echo "Отменено"
+    return 0
+  fi
+  apply_config 'clients |= map(select(.id != $id))' --arg id "$id"
+  if ((kick)); then
+    restart_or_rollback
+    echo "Удалён: ${name:-$id}. Xray перезапущен — все активные сессии сброшены."
+  elif runtime_rm "$name"; then
+    echo "Удалён без перезапуска: ${name:-$id}"
+    echo "Внимание: новые подключения отклоняются, но уже открытые сессии работают до своего закрытия."
+    echo "Оборвать их сейчас: xrayctl restart (сбросит сессии ВСЕХ пользователей)."
+  else
+    echo "API недоступен или у пользователя нет имени (старый формат) — перезапускаю Xray" >&2
+    restart_or_rollback
+    echo "Удалён: ${name:-$id}. Xray перезапущен."
+  fi
+}
+
+cmd_link() {
+  local id label
+  id=$(pick "${1:-}" "Номер, имя или UUID")
+  label=${2:-$(email_of "$id")}
+  show_link "$id" "$label" "Ссылка для подключения"
+}
+
+cmd_main() {
+  local id
+  id=$(resolve main)
+  if [[ -z $id ]]; then id=$(resolve 1); fi
+  show_link "$id" "$(email_of "$id" MainUser)" "Основной пользователь"
+}
+
+cmd_stats() {
+  local reset=() raw users
+  case ${1:-} in
+    -r | --reset) reset=(-reset) ;;
+    '') ;;
+    *) die "использование: xrayctl stats [--reset]" ;;
+  esac
+  [[ -n $API ]] || die "API не включён в конфиге — выполни: xrayctl migrate"
+  raw=$(xray api statsquery -s "$API" -t 5 -pattern '>>>traffic>>>' ${reset[@]+"${reset[@]}"} 2>&1) \
+    || die "API не отвечает: $raw"
+  users=$(q '[clients[] | .email // .id]')
+  echo
+  jq -r --argjson users "$users" '
+    def human:
+      if . >= 1099511627776 then (. / 1099511627776 * 100 | round / 100 | tostring) + " TiB"
+      elif . >= 1073741824 then (. / 1073741824 * 100 | round / 100 | tostring) + " GiB"
+      elif . >= 1048576    then (. / 1048576 * 100 | round / 100 | tostring) + " MiB"
+      elif . >= 1024       then (. / 1024 * 100 | round / 100 | tostring) + " KiB"
+      else tostring + " B" end;
+    def pad($n): . + (reduce range(0; ([$n - length, 0] | max)) as $_ (""; . + " "));
+    def table:
+      . as $t
+      | ($t | transpose | map(map(length) | max)) as $w
+      | $t[] | [range(0; length) as $i | .[$i] | pad($w[$i])] | join("  ");
+    def total($s; $u; $d): [$s[] | select(.k == "user" and .n == $u and .d == $d) | .v] | add // 0;
+    ([.stat[]? | (.name | split(">>>")) as $p
+       | {k: $p[0], n: $p[1], d: $p[3], v: ((.value // 0) | tonumber)}]) as $s
+    | ($users
+       | map({u: ., up: total($s; .; "uplink"), down: total($s; .; "downlink")} | . + {sum: (.up + .down)})
+       | sort_by(-.sum)) as $rows
+    | ([["ПОЛЬЗОВАТЕЛЬ", "UPLOAD", "DOWNLOAD", "ВСЕГО"]]
+        + [$rows[] | [.u, (.up | human), (.down | human), (.sum | human)]]
+        + [["ИТОГО", ($rows | map(.up) | add // 0 | human), ($rows | map(.down) | add // 0 | human),
+            ($rows | map(.sum) | add // 0 | human)]]) | table' <<<"$raw"
+  echo
+  if [[ ${reset[0]:-} == -reset ]]; then
+    echo "Счётчики обнулены."
+  else
+    echo "Счётчики копятся с момента запуска Xray и обнуляются при его рестарте."
+  fi
+  echo
+}
+
+cmd_status() {
+  local unit port_state rc=0 api_state cfg_n rt_n=''
+  unit=$(systemctl is-active xray 2>/dev/null || true)
+  [[ $unit == active ]] || rc=1
+  if port_listening; then port_state='слушается'; else port_state='НЕ слушается'; rc=1; fi
+  cfg_n=$(q 'clients | length')
+  if api_up; then
+    rt_n=$(api_count)
+    api_state="отвечает ($API)"
+  elif [[ -n $API ]]; then
+    api_state="НЕ отвечает ($API)"
+  else
+    api_state='не включён — xrayctl migrate'
+  fi
+  echo
+  kv 'Версия:' "$(xray version | sed -n 1p)"
+  kv 'Unit xray:' "${unit:-неизвестно}"
+  kv "Порт $PORT:" "$port_state"
+  kv 'API:' "$api_state"
+  kv 'Транспорт:' "$TRANSPORT, SNI $SNI, fp $FINGERPRINT"
+  kv 'Пользователей:' "$cfg_n"
+  if [[ -n $rt_n && $rt_n != "$cfg_n" ]]; then
+    echo "Внимание: в работающем Xray пользователей $rt_n, в конфиге $cfg_n — выполни xrayctl restart"
+  fi
+  echo
+  return "$rc"
+}
+
+# ─── Самопроверка ────────────────────────────────────────
+# Поднимает временный клиент Xray с параметрами ссылки основного пользователя, подключается
+# к своему же порту через REALITY и открывает CHECK_URL — тот же путь, что проходит телефон:
+# UUID, ключ, shortId, flow, SNI, транспорт, роутинг и выход сервера в интернет.
+
+chk() {  # chk <ok|fail|warn> <что> <подробности>
+  local mark
+  local pad=$((18 - ${#2}))   # ширина в символах, а не байтах (кириллица)
+  case $1 in ok) mark='[ OK ]' ;; fail) mark='[FAIL]' ;; *) mark='[ !! ]' ;; esac
+  printf '  %s %s%*s %s\n' "$mark" "$2" "$((pad > 0 ? pad : 0))" '' "$3"
+}
+
+free_port() {
+  local p _
+  for _ in $(seq 50); do
+    p=$(shuf -i 20000-60000 -n 1)
+    if ! ss -Htln "sport = :$p" | grep -q .; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# probe_link <режим XHTTP|''> <пресет|JSON Extra> <url> → PROBE_CODE: HTTP-код (000 — не прошло).
+# Поднимает временный клиент Xray с параметрами ссылки main и открывает url через туннель.
+# Лог клиента остаётся в $PROBE_LOG (для диагностики).
+PROBE_LOG=''
+PROBE_CODE=''
+probe_link() {
+  local mode=$1 extra url=$3 id flow ccfg lp code _
+  extra=$(extra_json "$2")
+  id=$(resolve main)
+  if [[ -z $id ]]; then id=$(resolve 1); fi
+  flow=$(q 'first(clients[] | select(.id == $id) | .flow // "")' --arg id "$id")
+  PROBE_CODE=000
+  lp=$(free_port) || return 0
+  ccfg=$(mktemp --suffix=.json)
+  PROBE_LOG=$(mktemp)
+  TMPS+=("$ccfg" "$PROBE_LOG")
+  jq -n --argjson lp "$lp" --argjson port "$PORT" --arg id "$id" --arg flow "$flow" --arg net "$TRANSPORT" \
+    --arg sni "$SNI" --arg fp "$FINGERPRINT" --arg pbk "$PUBLIC_KEY" --arg sid "$SHORT_ID" \
+    --arg xpath "${XHTTP_PATH:-/}" --arg mode "$mode" --arg extra "$extra" '
+    {log: {loglevel: "warning"},
+     inbounds: [{listen: "127.0.0.1", port: $lp, protocol: "socks", settings: {udp: false}}],
+     outbounds: [{protocol: "vless",
+       settings: {vnext: [{address: "127.0.0.1", port: $port,
+         users: [{id: $id, encryption: "none"} + (if $flow == "" then {} else {flow: $flow} end)]}]},
+       streamSettings: ({network: $net, security: "reality",
+         realitySettings: {serverName: $sni, fingerprint: $fp, publicKey: $pbk, shortId: $sid, spiderX: ""}}
+         + (if $net == "xhttp" then
+              {xhttpSettings: ({path: $xpath, mode: $mode}
+                + (if $extra == "" then {} else {extra: ($extra | fromjson)} end))}
+            else {} end))}]}' > "$ccfg"
+  xray run -config "$ccfg" > "$PROBE_LOG" 2>&1 &
+  CHECK_PID=$!
+  for _ in $(seq 50); do
+    if ss -Htln "sport = :$lp" | grep -q .; then break; fi
+    sleep 0.1
+  done
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 --noproxy '' -x "socks5h://127.0.0.1:$lp" "$url" 2>/dev/null) || true
+  kill "$CHECK_PID" 2>/dev/null || true
+  wait "$CHECK_PID" 2>/dev/null || true
+  CHECK_PID=''
+  PROBE_CODE=${code:-000}
+}
+
+cmd_check() {
+  local url=${CHECK_URL:-https://www.gstatic.com/generate_204}
+  local ip_url=${IP_CHECK_URL:-https://api.ipify.org}
+  local rc=0 pub addr_ip v code direct errs errs_log=''
+
+  echo
+  echo "Самопроверка: $SERVER_ADDR:$PORT, $TRANSPORT, SNI $SNI"
+  echo "────────────────────────────────────────────────────────"
+
+  if systemctl is-active --quiet xray; then chk ok "Сервис xray" "запущен"
+  else chk fail "Сервис xray" "не запущен — journalctl -u xray -n 50"; rc=1; fi
+  if port_listening; then chk ok "Порт $PORT" "слушается"
+  else chk fail "Порт $PORT" "не слушается"; rc=1; fi
+
+  # Адрес в ссылках должен совпадать с внешним IP сервера (типичная беда после смены IP)
+  pub=$(curl -4 -fsS --max-time 6 "$ip_url" 2>/dev/null | tr -d '[:space:]') || pub=''
+  if [[ $SERVER_ADDR =~ ^[0-9.]+$ ]]; then addr_ip=$SERVER_ADDR
+  else addr_ip=$(getent ahostsv4 "$SERVER_ADDR" 2>/dev/null | awk 'NR == 1 {print $1}'); fi
+  if [[ -z $pub ]]; then chk warn "Адрес в ссылках" "$SERVER_ADDR (внешний IP узнать не удалось)"
+  elif [[ $pub == "$addr_ip" ]]; then chk ok "Адрес в ссылках" "$SERVER_ADDR = внешний IP сервера"
+  else
+    if [[ $addr_ip == "$SERVER_ADDR" ]]; then addr_ip=''; fi
+    chk fail "Адрес в ссылках" "$SERVER_ADDR${addr_ip:+ ($addr_ip)}, а внешний IP сервера $pub"
+    echo "         Исправить: sed -i 's/^SERVER_ADDR=.*/SERVER_ADDR=$pub/' $PARAMS и выдать ссылки заново"
+    rc=1
+  fi
+
+  # Параметры ссылок (params.env) должны совпадать с конфигом сервера
+  local priv derived bad=()
+  priv=$(q '.inbounds[ib].streamSettings.realitySettings.privateKey // empty')
+  derived=$(xray x25519 -i "$priv" 2>/dev/null \
+    | awk -F': *' 'tolower($1) ~ /public|password/ {print $2; exit}' | tr -d '[:space:]') || derived=''
+  if [[ $derived != "$PUBLIC_KEY" ]]; then bad+=("pbk не от privateKey сервера"); fi
+  if [[ $(q '[.inbounds[ib].streamSettings.realitySettings.shortIds[]?] | any(. == $s)' --arg s "$SHORT_ID") != true ]]; then
+    bad+=("shortId $SHORT_ID нет в конфиге")
+  fi
+  if [[ $(q '[.inbounds[ib].streamSettings.realitySettings.serverNames[]?] | any(. == $s)' --arg s "$SNI") != true ]]; then
+    bad+=("SNI $SNI нет в serverNames")
+  fi
+  if [[ $(q '.inbounds[ib].streamSettings.network // "tcp"') != "$TRANSPORT" ]]; then
+    bad+=("транспорт в конфиге не $TRANSPORT")
+  fi
+  if [[ $(q '.inbounds[ib].port') != "$PORT" ]]; then bad+=("порт в конфиге не $PORT"); fi
+  if [[ $TRANSPORT == xhttp && $(q '.inbounds[ib].streamSettings.xhttpSettings.path // "/"') != "$XHTTP_PATH" ]]; then
+    bad+=("путь XHTTP в конфиге не $XHTTP_PATH")
+  fi
+  if ((${#bad[@]} == 0)); then chk ok "Параметры ссылок" "совпадают с конфигом сервера"
+  else
+    chk fail "Параметры ссылок" "$(IFS=';'; echo "${bad[*]}" | sed 's/;/; /g')"
+    echo "         $PARAMS не соответствует $CONFIG — ссылки из xrayctl будут нерабочими"
+    rc=1
+  fi
+
+  # REALITY на каждое подключение ходит на этот сайт — он должен быть доступен с сервера
+  v=$(curl -so /dev/null --max-time 8 --tlsv1.3 --http2 -w '%{http_version}' "https://$SNI" 2>/dev/null) || v=''
+  if [[ $v == 2 ]]; then chk ok "SNI-сайт" "$SNI отвечает по TLS 1.3 + HTTP/2"
+  else chk fail "SNI-сайт" "$SNI недоступен с сервера или без TLS 1.3/HTTP/2 — смени SNI"; rc=1; fi
+
+  # Сквозной тест: клиент из ссылки main → REALITY → сервер → интернет.
+  # Для XHTTP проверяются все три режима: сервер обязан принимать любой, какой бы ни выбрали в ссылках.
+  local -a modes=('')
+  local m label ok_modes=() bad_modes=()
+  if [[ $TRANSPORT == xhttp ]]; then modes=(stream-one stream-up packet-up); fi
+  for m in "${modes[@]}"; do
+    probe_link "$m" "${XHTTP_EXTRA:-default}" "$url"
+    code=$PROBE_CODE
+    label=${m:-main}
+    if [[ $TRANSPORT == xhttp && $m == "$XHTTP_MODE" ]]; then label="$m*"; fi
+    if [[ ${code:-000} != 000 ]]; then ok_modes+=("$label"); else bad_modes+=("$label"); errs_log=$PROBE_LOG; fi
+  done
+
+  if ((${#bad_modes[@]} == 0)); then
+    if [[ $TRANSPORT == xhttp ]]; then
+      chk ok "Сквозной тест" "XHTTP ${ok_modes[*]} → $url: HTTP $code (* — режим в ссылках, Extra: $(extra_label "$XHTTP_EXTRA"))"
+    else
+      chk ok "Сквозной тест" "ссылка main через REALITY → $url: HTTP $code"
+    fi
+  else
+    rc=1
+    direct=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null) || true
+    if [[ ${direct:-000} == 000 ]]; then
+      chk fail "Сквозной тест" "у самого сервера нет доступа к $url — проверь DNS и интернет на сервере"
+    else
+      if [[ $TRANSPORT == xhttp ]]; then
+        chk fail "Сквозной тест" "не проходят режимы: ${bad_modes[*]}${ok_modes[*]:+; работают: ${ok_modes[*]}}"
+      else
+        chk fail "Сквозной тест" "через туннель не проходит, хотя напрямую сервер до $url достаёт"
+      fi
+      errs=$(grep -E '\[(Warning|Error)\]|failed' "$errs_log" | grep -v 'core: Xray .* started' | tail -n 5) || true
+      if [[ -n $errs ]]; then
+        echo "         Ошибки временного клиента:"
+        sed 's/^/           /' <<<"$errs"
+      fi
+      echo "         Лог сервера: journalctl -u xray -n 30 --no-pager"
+    fi
+  fi
+
+  # Блок RU проверяем только при рабочем туннеле: иначе «закрыто» ничего не доказывает
+  if ((${#bad_modes[@]} == 0)); then
+    if ru_enabled; then
+      ru_check || rc=1
+    else
+      chk warn "Блок RU" "выключен — VPN пускает на российские сайты и IP (включить: xrayctl ru on)"
+    fi
+  fi
+
+  echo
+  if ((rc == 0)); then
+    echo "  Сервер и ссылки исправны. Если клиент всё равно показывает -1:"
+    echo "   1) удали в клиенте старый профиль и импортируй ссылку заново (xrayctl link <имя>):"
+    echo "      после переустановки ключи новые, старые профили работать не будут;"
+    echo "   2) проверь, доходит ли до порта с твоего устройства. Windows PowerShell:"
+    echo "      Test-NetConnection $SERVER_ADDR -Port $PORT   (TcpTestSucceeded должно быть True)"
+    echo "      False — порт закрыт по пути: фаервол хостера или блокировка провайдера."
+  fi
+  echo
+  return "$rc"
+}
+
+# ─── xrayctl xhttp ───────────────────────────────────────
+
+gen_xhttp_path() {  # та же логика, что в установщике
+  local -a pre=(api api/v1 api/v2 api/v3 v1 v2 rest/v1 internal/api app/api)
+  local -a word=(events sync telemetry collect messages updates stream realtime metrics analytics feed notifications)
+  local p=${pre[RANDOM % ${#pre[@]}]} w=${word[RANDOM % ${#word[@]}]} id
+  id=$(openssl rand -hex 5)
+  case $((RANDOM % 3)) in
+    0) printf '/%s/%s/%s\n' "$p" "$w" "$id" ;;
+    1) printf '/%s/%s/%s\n' "$p" "$id" "$w" ;;
+    *) printf '/%s/%s-%s\n' "$p" "$w" "$id" ;;
+  esac
+}
+
+xhttp_help() {
+  cat <<EOF
+Использование: xrayctl xhttp <команда>
+
+  show                       текущие настройки и описание режимов и пресетов (по умолчанию)
+  set <режим> [пресет|JSON]  режим и Extra для НОВЫХ ссылок; сервер не перезапускается
+  links [№|имя|uuid]         9 тестовых ссылок: 3 режима × 3 пресета — для замера на клиенте
+  path [random|/свой/путь]   сменить путь XHTTP на сервере (рестарт; ВСЕ ссылки нужно выдать заново)
+
+Режимы: ${XHTTP_MODES[*]}    Пресеты Extra: ${XHTTP_PRESETS[*]} или свой JSON
+Пример: xrayctl xhttp set stream-up rotate
+EOF
+}
+
+xhttp_show() {
+  local extra
+  extra=$(extra_json "$XHTTP_EXTRA")
+  echo
+  kv 'Путь:' "$XHTTP_PATH"
+  kv 'Режим в ссылках:' "$XHTTP_MODE (сервер принимает все режимы)"
+  kv 'Extra в ссылках:' "$(extra_label "$XHTTP_EXTRA")${extra:+  $extra}"
+  cat <<'EOF'
+
+Режимы (выбирает клиент, сервер принимает любой):
+  stream-one  один HTTP-запрос на соединение, данные в обе стороны. Меньше всего запросов и задержка;
+              Xray в режиме auto с REALITY выбирает именно его. Начинать стоит с него.
+  stream-up   отдельный запрос на отдачу (POST) и на загрузку (GET). Пробовать, если stream-one
+              рвётся или медленно грузит: так ведут себя сети, режущие «двусторонние» долгие запросы.
+  packet-up   отдача пачками коротких POST-запросов. Самый совместимый (проходит через любые прокси
+              и CDN), но отдача медленнее. Последний вариант, если другие не работают.
+
+Пресеты Extra (настройки мультиплексирования xmux на клиенте):
+  default     встроенные в Xray: до 3 соединений, каждое живёт 30–50 минут
+  single      одно соединение на всё, 30–50 минут: меньше рукопожатий, как одна вкладка браузера
+  rotate      2–4 соединения, смена каждые 1–2 минуты: если провайдер «замораживает» долгие соединения
+
+Как выбрать под свою сеть — замерить с устройства, где работает клиент:
+  1) sudo xrayctl xhttp links > xhttp-test.txt   — 9 ссылок «режим × пресет»
+  2) на Windows: xhttp-bench.ps1 (замеряет пинг, загрузку и отдачу каждой) или импорт всех ссылок
+     в v2rayN (Ctrl+V) → выделить все → «Тест реальной задержки» и «Тест скорости»
+  3) sudo xrayctl xhttp set <лучший режим> <лучший пресет>  и выдать ссылки заново
+
+EOF
+}
+
+xhttp_set() {
+  local mode=${1:-} preset=${2:-$XHTTP_EXTRA} m
+  [[ -n $mode ]] || die "использование: xrayctl xhttp set <режим> [пресет|JSON]"
+  is_xhttp_mode "$mode" || die "неизвестный режим '$mode' (допустимо: ${XHTTP_MODES[*]})"
+  extra_json "$preset" >/dev/null
+  lock
+  m=$mode
+  if [[ $m == auto ]]; then m=stream-one; fi   # auto с REALITY = stream-one
+  echo "Проверяю $mode + $(extra_label "$preset") через туннель на этом сервере..."
+  probe_link "$m" "$preset" "${CHECK_URL:-https://www.gstatic.com/generate_204}"
+  if [[ $PROBE_CODE == 000 ]]; then
+    grep -E '\[(Warning|Error)\]|failed' "$PROBE_LOG" | tail -n 5 >&2 || true
+    die "с этими настройками подключиться не удалось — ничего не изменено"
+  fi
+  set_param XHTTP_MODE "$mode"
+  set_param XHTTP_EXTRA "$preset"
+  echo "Готово: новые ссылки будут с mode=$mode, Extra: $(extra_label "$preset")."
+  echo "Уже выданные ссылки продолжают работать со своими настройками. Обновить ссылку: xrayctl link <имя>"
+}
+
+xhttp_links() {
+  local id name m p
+  id=$(pick "${1:-main}" "Номер, имя или UUID")
+  name=$(email_of "$id" user)
+  for m in stream-one stream-up packet-up; do
+    for p in "${XHTTP_PRESETS[@]}"; do
+      make_link "$id" "$name · $m · $p" "$m" "$p"
+    done
+  done
+  cat >&2 <<EOF
+
+Выше 9 тестовых ссылок для «$name» (все рабочие, сервер принимает любой режим).
+Замерь их на клиенте: xhttp-bench.ps1 или импорт в v2rayN (Ctrl+V) → тест задержки и скорости.
+Лучший вариант закрепи: sudo xrayctl xhttp set <режим> <пресет>
+EOF
+}
+
+xhttp_path() {
+  local new=${1:-} yes=${2:-}
+  if [[ -z $new ]]; then
+    echo "Текущий путь: $XHTTP_PATH"
+    echo "Сменить: xrayctl xhttp path random  или  xrayctl xhttp path /свой/путь"
+    return 0
+  fi
+  if [[ $new == random ]]; then new=$(gen_xhttp_path); fi
+  [[ $new =~ ^/[A-Za-z0-9._~/-]{0,120}$ && $new != *//* ]] \
+    || die "путь: начинается с /, только латиница, цифры и . _ ~ - /, без ? и //"
+  if [[ $new == "$XHTTP_PATH" ]]; then echo "Путь уже $new"; return 0; fi
+  echo "Новый путь: $new (было: $XHTTP_PATH)"
+  echo "ВНИМАНИЕ: Xray перезапустится, а ВСЕ выданные ссылки перестанут работать — их нужно выдать заново."
+  if [[ $yes != -y ]]; then
+    [[ -t 0 ]] || die "без терминала добавь подтверждение: xrayctl xhttp path $new -y"
+    confirm "Продолжить?" || { echo "Отменено"; return 0; }
+  fi
+  apply_config '.inbounds[ib].streamSettings.xhttpSettings.path = $p' --arg p "$new"
+  restart_or_rollback
+  set_param XHTTP_PATH "$new"
+  XHTTP_PATH=$new
+  echo "Путь изменён. Новые ссылки: xrayctl link <имя> (или xrayctl main)"
+}
+
+cmd_xhttp() {
+  local sub=${1:-show}
+  shift || true
+  [[ $TRANSPORT == xhttp ]] || die "сервер установлен с транспортом $TRANSPORT — команды xhttp только для XHTTP"
+  case $sub in
+    show) xhttp_show ;;
+    set) xhttp_set "$@" ;;
+    links) xhttp_links "$@" ;;
+    path) xhttp_path "$@" ;;
+    help | -h | --help) xhttp_help ;;
+    *) xhttp_help >&2; exit 1 ;;
+  esac
+}
+
+# ─── Блок RU ─────────────────────────────────────────────
+
+ru_enabled() {
+  [[ $(q '[.routing.rules[]? | select((.ruleTag // "") | startswith("block-ru"))] | length') -gt 0 ]]
+}
+
+ru_client_hint() {
+  cat <<'EOF'
+На клиенте пусти российские адреса напрямую, иначе они не откроются совсем:
+  v2rayN: Настройки → Настройки маршрутизации → в своём наборе правил добавь правило
+    исходящее (outboundTag): direct
+    Domain: geosite:category-ru, domain:ru, domain:su, domain:xn--p1ai
+    IP:     geoip:ru
+  и подними его выше правила «всё остальное через прокси».
+EOF
+}
+
+# probe_mode — режим для проверок через туннель: режим ссылок (auto → stream-one) или пусто для TCP
+probe_mode() {
+  if [[ $TRANSPORT != xhttp ]]; then echo ''; return 0; fi
+  if [[ $XHTTP_MODE == auto ]]; then echo stream-one; else echo "$XHTTP_MODE"; fi
+}
+
+# ru_check — российский домен и российский IP должны открываться с сервера напрямую,
+# но не через туннель. Пишет строку [ OK ]/[FAIL]/[ !! ]; возвращает 1 при утечке.
+ru_check() {
+  local dom=${RU_CHECK_DOMAIN:-ya.ru} ip=${RU_CHECK_IP:-} m d1 d2 t1 t2 leaks=()
+  if [[ -z $ip ]]; then ip=$(getent ahostsv4 "$dom" 2>/dev/null | awk 'NR == 1 {print $1}'); fi
+  m=$(probe_mode)
+  d1=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$dom" 2>/dev/null) || true
+  probe_link "$m" "${XHTTP_EXTRA:-default}" "https://$dom"
+  t1=$PROBE_CODE
+  if [[ -n $ip ]]; then
+    d2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$ip/" 2>/dev/null) || true
+    probe_link "$m" "${XHTTP_EXTRA:-default}" "http://$ip/"
+    t2=$PROBE_CODE
+  fi
+  if [[ $t1 != 000 ]]; then leaks+=("$dom"); fi
+  if [[ -n $ip && $t2 != 000 ]]; then leaks+=("$ip"); fi
+  if ((${#leaks[@]})); then
+    chk fail "Блок RU" "через туннель открывается: ${leaks[*]} — проверь xrayctl ru и геобазы Xray"
+    return 1
+  fi
+  if [[ ${d1:-000} == 000 && ${d2:-000} == 000 ]]; then
+    chk warn "Блок RU" "включён, но проверить нельзя: $dom${ip:+ и $ip} недоступны и напрямую"
+  else
+    chk ok "Блок RU" "$dom (домен) и ${ip:-—} (IP РФ) через туннель закрыты, напрямую с сервера открыты"
+  fi
+  return 0
+}
+
+cmd_ru() {
+  case ${1:-status} in
+    status)
+      echo
+      if ru_enabled; then
+        echo "Блок RU: включён. VPN-клиенты не попадут на .ru/.su/.рф и другие зоны РФ,"
+        echo "российские сервисы на других доменах (geosite:category-ru) и российские IP (geoip:ru)."
+      else
+        echo "Блок RU: выключен. Включить: sudo xrayctl ru on"
+      fi
+      echo
+      ru_client_hint
+      echo
+      ;;
+    on)
+      lock
+      apply_config '
+        .routing.domainStrategy = "IPIfNonMatch"
+        | if any(.outbounds[]?; .tag == "block") then . else .outbounds += [{protocol: "blackhole", tag: "block"}] end
+        | .routing.rules = (
+            ((.routing.rules // []) | map(select((.ruleTag // "") | startswith("block-ru") | not))) as $r
+            | [$r[] | select(.ip == ["geoip:private"])] + $ru + [$r[] | select(.ip != ["geoip:private"])])' \
+        --argjson ru "$RU_RULES"
+      if ((CHANGED)); then
+        echo "Перезапускаю Xray (активные сессии переподключатся)..."
+        restart_or_rollback
+        echo "Блок RU включён."
+      else
+        echo "Блок RU уже включён."
+      fi
+      echo
+      ru_client_hint
+      ;;
+    off)
+      lock
+      apply_config '.routing.rules |= map(select((.ruleTag // "") | startswith("block-ru") | not))'
+      if ((CHANGED)); then
+        echo "Перезапускаю Xray (активные сессии переподключатся)..."
+        restart_or_rollback
+        echo "Блок RU выключен: российские сайты и IP снова доступны через VPN."
+      else
+        echo "Блок RU уже выключен."
+      fi
+      ;;
+    *) die "использование: xrayctl ru [status|on|off]" ;;
+  esac
+}
+
+cmd_restart() {
+  lock
+  BACKUP=''
+  restart_or_rollback
+  echo "Xray перезапущен, активные сессии сброшены."
+}
+
+# Приводит существующий конфиг к актуальному виду: имена (email) у всех пользователей,
+# gRPC API на loopback, статистика по пользователям, блокировка приватных сетей и BitTorrent.
+cmd_migrate() {
+  local listen holder port=${API_PORT:-10085}
+  listen=$(q '.api.listen // empty')
+  if [[ -z $listen ]]; then
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || die "некорректный API_PORT: $port"
+    [[ $port != "$PORT" ]] || die "API_PORT совпадает с портом Xray"
+    holder=$(ss -Htlnp "sport = :$port")
+    if [[ -n $holder && $holder != *'"xray"'* ]]; then die "порт $port под API уже занят: задай другой через API_PORT=..."; fi
+    listen="127.0.0.1:$port"
+  fi
+  apply_config '
+    .inbounds[ib].tag //= "vless-in"
+    | .inbounds[ib].settings.clients |= (
+        . as $all
+        | to_entries
+        | map(.value + (
+            if ((.value.email // "") | length) > 0 then {}
+            else {email: (if .key == 0 and (($all | map(.email // "") | index("main")) == null)
+                          then "main" else "user-" + .value.id[0:8] end)}
+            end)))
+    | .stats //= {}
+    | .api = {tag: "api", listen: (.api.listen // $listen), services: ["HandlerService", "StatsService"]}
+    | .policy.levels["0"].statsUserUplink = true
+    | .policy.levels["0"].statsUserDownlink = true
+    | .policy.system.statsInboundUplink = true
+    | .policy.system.statsInboundDownlink = true
+    | .log.access = "none"
+    | .inbounds[ib].sniffing = {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+    | if any(.outbounds[]?; .tag == "block") then . else .outbounds += [{protocol: "blackhole", tag: "block"}] end
+    | .routing.domainStrategy = "IPIfNonMatch"
+    | .routing.rules = ($rules + ((.routing.rules // []) - $rules))' \
+    --arg listen "$listen" \
+    --argjson rules '[
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+    ]'
+  load_api
+  if ((CHANGED)) || ! api_up; then
+    echo "Перезапускаю Xray (один раз, активные сессии переподключатся)..."
+    restart_or_rollback
+  else
+    echo "Конфиг уже в нужном состоянии, перезапуск не нужен."
+  fi
+  api_up || die "API не отвечает на $API после миграции"
+  echo "Готово: API $API, статистика по пользователям включена, приватные сети и BitTorrent закрыты."
+}
+
+case ${0##*/} in
+  userlist)  set -- list "$@" ;;
+  newuser)   set -- add "$@" ;;
+  rmuser)    set -- rm "$@" ;;
+  sharelink) set -- link "$@" ;;
+  mainuser)  set -- main "$@" ;;
+esac
+
+cmd=${1:-help}
+shift || true
+case $cmd in
+  list | ls)       load; cmd_list ;;
+  add | new)       load; cmd_add "$@" ;;
+  rm | del)        load; cmd_rm "$@" ;;
+  link | share)    load; cmd_link "$@" ;;
+  main)            load; cmd_main ;;
+  stats)           load; cmd_stats "$@" ;;
+  status)          load; cmd_status ;;
+  check | test)    load; cmd_check ;;
+  xhttp)           load; cmd_xhttp "$@" ;;
+  ru)              load; cmd_ru "$@" ;;
+  version | -V | --version) echo "$SCRIPT_VERSION, $(xray version 2>/dev/null | sed -n 1p)" ;;
+  restart)         load; cmd_restart ;;
+  migrate | harden) load; cmd_migrate ;;
+  help | -h | --help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
+XRAYCTL
+  install -m 755 -o root -g root "$tmp" "$CTL"
+  for n in userlist mainuser newuser rmuser sharelink; do
+    ln -sfn "$CTL" "/usr/local/bin/$n"
+  done
+}
+
+# ─── Сценарии ────────────────────────────────────────────
+
+fresh_install() {
+  collect_params
+  gen_keys
+  backup_config
+  write_config
+  write_params
+  secure_files
+  install_ctl
+  install_zabbix
+  open_firewall
+  enable_bbr
+  start_xray
+  "$CTL" check || warn "Самопроверка нашла проблемы — подробности выше"
+
+  printf '\n%s════════════════════════════════════%s\n' "$GREEN" "$NC"
+  printf '%s       Установка завершена!%s\n' "$GREEN" "$NC"
+  printf '%s════════════════════════════════════%s\n' "$GREEN" "$NC"
+  printf 'Порт:       %s\nAPI:        127.0.0.1:%s (только loopback)\nSNI:        %s\nОтпечаток:  %s\nТранспорт:  %s\nPublic key: %s\nShort ID:   %s\n' \
+    "$PORT" "$API_PORT" "$SNI" "$FINGERPRINT" "$TRANSPORT" "$PUBLIC_KEY" "$SHORT_ID"
+  if [[ $TRANSPORT == xhttp ]]; then
+    printf 'XHTTP:      путь %s, режим в ссылках %s, Extra %s\n' "$XHTTP_PATH" "$XHTTP_MODE" "$XHTTP_EXTRA"
+    printf 'Подобрать режим и Extra под свою сеть: %ssudo xrayctl xhttp%s\n' "$CYAN" "$NC"
+  fi
+  "$CTL" main
+  if [[ $BLOCK_RU == y ]]; then
+    printf '\n%sБлок RU включён:%s российские сайты и IP через этот сервер не откроются.\n' "$YELLOW" "$NC"
+    printf 'Пусти их на клиенте напрямую — правило маршрутизации: подробности  sudo xrayctl ru\n'
+  fi
+  printf '\n%sВАЖНО:%s это новая установка с новыми ключами. Старые профили этого сервера в клиентах\n' "$YELLOW" "$NC"
+  printf 'работать не будут — удали их и импортируй ссылку или QR выше.\n'
+  printf '\nУправление: %sxrayctl list | add <имя> | rm [-k] <№|имя> | link <№|имя> | main | stats | status | check | xhttp%s\n' "$CYAN" "$NC"
+  printf 'Бэкапы конфига: %s\n' "$BACKUP_DIR"
+}
+
+upgrade() {
+  local mig=${MIGRATE:-${HARDEN:-}}
+  log "Режим обновления: конфиг, ключи и пользователи сохраняются"
+  # shellcheck source=/dev/null
+  source "$PARAMS"
+  SERVER_ADDR=${SERVER_ADDR:-${SERVER_IP:-}}
+  if [[ $TRANSPORT == xhttp ]]; then
+    # Старые установки: путь берём из конфига сервера, чтобы выданные ссылки продолжили работать
+    XHTTP_PATH=${XHTTP_PATH:-$(jq -r '[.inbounds[] | select(.protocol == "vless")][0].streamSettings.xhttpSettings.path // "/"' "$CONFIG")}
+    XHTTP_MODE=${XHTTP_MODE:-stream-one}
+    XHTTP_EXTRA=${XHTTP_EXTRA:-default}
+  fi
+  write_params   # приводим params.env к новому формату (экранирование, SERVER_ADDR, XHTTP_*)
+  secure_files
+  install_ctl
+  install_zabbix
+  if [[ $TRANSPORT == xhttp && $XHTTP_PATH == / ]]; then
+    warn "XHTTP работает на пути «/». Сменить на правдоподобный: sudo xrayctl xhttp path random (старые ссылки перестанут работать)"
+  fi
+  if [[ -z $mig && -n $TTY ]]; then
+    confirm "Включить API управления, статистику трафика и hardening? Нужен один перезапуск Xray — сессии переподключатся" y \
+      && mig=y || mig=n
+  fi
+  if [[ $mig == y ]]; then
+    "$CTL" migrate
+  else
+    warn "Миграция конфига пропущена. Без неё add/rm делают рестарт Xray, а статистики нет. Позже: xrayctl migrate"
+  fi
+  systemctl enable xray >/dev/null 2>&1
+  systemctl is-active --quiet xray || systemctl start xray
+  health_check
+  # Блок RU: на уже установленных серверах — по вопросу (без терминала — включается, BLOCK_RU=n отключает)
+  if [[ -z ${BLOCK_RU:-} ]]; then
+    if [[ -n $TTY ]]; then
+      confirm "Не выпускать VPN-трафик на российские сайты и IP (.ru/.su/.рф, RU-сервисы, geoip:ru)? Нужен перезапуск Xray" y \
+        && BLOCK_RU=y || BLOCK_RU=n
+    else
+      BLOCK_RU=y
+    fi
+  fi
+  if [[ $BLOCK_RU == [yYдД]* ]]; then "$CTL" ru on; else "$CTL" ru off; fi
+  "$CTL" status || true
+  "$CTL" check || warn "Самопроверка нашла проблемы — подробности выше"
+  log "Обновление завершено"
+}
+
+main() {
+  local mode=install
+  preflight
+  if [[ -f $CONFIG && -f $PARAMS ]]; then
+    if [[ ${FORCE_REINSTALL:-n} == y ]]; then
+      mode=install
+    elif [[ -n $TTY ]]; then
+      warn "Xray уже установлен этим скриптом."
+      if confirm "Переустановить с нуля? Новые ключи — ВСЕ текущие ссылки перестанут работать" n; then
+        mode=install
+      else
+        mode=upgrade
+      fi
+    else
+      mode=upgrade
+    fi
+  fi
+
+  install_deps
+  install_xray
+
+  if [[ $mode == upgrade ]]; then
+    upgrade
+  else
+    fresh_install
+  fi
+}
+
+# Вызов main — строго последней строкой. При `curl ... | bash` bash выполняет скрипт по мере
+# чтения, поэтому до этой строки ничего не происходит: если скачивание оборвётся на середине,
+# установка просто не начнётся, а команды внутри main уже не смогут «съесть» остаток скрипта.
+main "$@"
